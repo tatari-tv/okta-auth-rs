@@ -1,0 +1,15 @@
+name: ci
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+  statuses: write
+
+jobs:
+  ci:
+    uses: tatari-tv/github-actions/.github/workflows/platform-standard-ci.yml@v5
+    secrets: inherit
