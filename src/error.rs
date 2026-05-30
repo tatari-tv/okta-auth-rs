@@ -9,9 +9,6 @@ pub enum OktaAuthError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[error("Failed to open browser: {0}")]
-    BrowserFailed(#[from] std::io::Error),
-
     #[error("Timed out waiting for authentication callback (60s)")]
     CallbackTimeout,
 
@@ -106,8 +103,7 @@ mod tests {
     #[test]
     fn error_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        // BindFailed contains Box<dyn Error + Send + Sync>, so the whole enum should be Send+Sync
-        // except BrowserFailed wraps io::Error which is Send+Sync
+        // BindFailed contains Box<dyn Error + Send + Sync>, so the whole enum is Send+Sync
         assert_send_sync::<OktaAuthError>();
     }
 
