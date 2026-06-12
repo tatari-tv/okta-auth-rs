@@ -62,7 +62,9 @@ impl Listener for HttpListener {
         match self.server.try_recv()? {
             Some(request) => {
                 let url = request.url().to_string();
-                trace!("HttpListener::poll: callback url={url}");
+                // Log only the path - the query carries the OAuth `code`/`state` secrets.
+                let path = url.split('?').next().unwrap_or("/");
+                trace!("HttpListener::poll: received callback request path={path}");
                 let capture = parse_request_url(&url);
                 respond(request, matches!(capture, Capture::OktaError(_)));
                 Ok(Some(capture))

@@ -340,4 +340,64 @@ mod tests {
         let dir = default_cache_dir("my-test-app");
         assert!(dir.ends_with("my-test-app"));
     }
+
+    // -- XDG resolution tests --
+    //
+    // Env-var mutation is process-global and unsafe under Edition 2024; `#[serial]`
+    // serializes these against each other. They restore prior values so they don't
+    // leak into other tests.
+
+    fn with_env(key: &str, value: Option<&Path>, body: impl FnOnce()) {
+        let prior = std::env::var_os(key);
+        match value {
+            Some(path) => unsafe { std::env::set_var(key, path) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        body();
+        match prior {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn xdg_config_dir_honors_absolute_xdg_config_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_env("XDG_CONFIG_HOME", Some(tmp.path()), || {
+            assert_eq!(xdg_config_dir().as_deref(), Some(tmp.path()));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn xdg_config_dir_falls_back_to_home_dot_config() {
+        let home = tempfile::tempdir().unwrap();
+        with_env("XDG_CONFIG_HOME", None, || {
+            with_env("HOME", Some(home.path()), || {
+                assert_eq!(xdg_config_dir(), Some(home.path().join(".config")));
+            });
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn xdg_config_dir_ignores_relative_xdg_config_home() {
+        // A non-absolute $XDG_CONFIG_HOME is ignored in favor of the $HOME fallback.
+        let home = tempfile::tempdir().unwrap();
+        with_env("XDG_CONFIG_HOME", Some(Path::new("relative/not-absolute")), || {
+            with_env("HOME", Some(home.path()), || {
+                assert_eq!(xdg_config_dir(), Some(home.path().join(".config")));
+            });
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn default_cache_dir_joins_app_name_under_xdg() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_env("XDG_CONFIG_HOME", Some(tmp.path()), || {
+            assert_eq!(default_cache_dir("my-app"), tmp.path().join("my-app"));
+        });
+    }
 }
