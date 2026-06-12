@@ -26,8 +26,24 @@ impl TokenCache {
     }
 }
 
+/// XDG config dir, honoring `$XDG_CONFIG_HOME` and falling back to `$HOME/.config`.
+///
+/// We deliberately do NOT use the `dirs` config/data helpers: those honor
+/// `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` only on Linux. On macOS they resolve via system
+/// APIs and return `~/Library/...`, ignoring the env vars. These helpers resolve to the
+/// same XDG layout on every platform.
+fn xdg_config_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+        let path = PathBuf::from(dir);
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".config"))
+}
+
 pub fn default_cache_dir(app_name: &str) -> PathBuf {
-    dirs::config_dir()
+    xdg_config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
         .join(app_name)
 }
