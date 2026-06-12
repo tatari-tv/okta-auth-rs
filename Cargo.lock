@@ -684,6 +684,7 @@ dependencies = [
  "log",
  "oauth2",
  "open",
+ "rustix",
  "serde",
  "serde_json",
  "serial_test",

@@ -1,16 +1,30 @@
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OktaAuthError {
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
 
+    /// The callback listener could not bind its port. Since binding now runs only
+    /// in an interactive session (after the `NonInteractive` early-return), this is
+    /// never fatal: the flow falls back to the paste path with `server = None`.
+    /// Nothing constructs this variant after the headless-auth redesign; it is
+    /// retained so external consumers matching on it do not break (removing it
+    /// would be a second SemVer-breaking change in the same release).
+    #[deprecated(note = "bind failure is now non-fatal; the flow falls back to the paste path")]
     #[error("Failed to bind to {addr}: another login may be running: {source}")]
     BindFailed {
         addr: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[error("Timed out waiting for authentication callback (60s)")]
+    #[error("Timed out waiting for authentication callback")]
     CallbackTimeout,
+
+    #[error(
+        "Okta token is missing or expired and no controlling terminal is available \
+         (non-interactive session). Re-authenticate in a terminal first, then retry."
+    )]
+    NonInteractive,
 
     #[error("No query parameters in callback")]
     NoQueryParams,
@@ -56,7 +70,7 @@ mod tests {
             (OktaAuthError::InvalidUrl("bad url".to_string()), "Invalid URL: bad url"),
             (
                 OktaAuthError::CallbackTimeout,
-                "Timed out waiting for authentication callback (60s)",
+                "Timed out waiting for authentication callback",
             ),
             (OktaAuthError::NoQueryParams, "No query parameters in callback"),
             (OktaAuthError::NoAuthCode, "No authorization code in callback"),
@@ -108,6 +122,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // BindFailed is retained for SemVer compatibility; still assert its message
     fn bind_failed_includes_addr_and_source() {
         let err = OktaAuthError::BindFailed {
             addr: "127.0.0.1:11313".to_string(),
