@@ -4,8 +4,7 @@ use log::{debug, info, warn};
 use oauth2::basic::BasicClient;
 use oauth2::url::Url;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope,
-    TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 
 use crate::OktaAuthError;
@@ -21,17 +20,16 @@ pub fn authorize(
 ) -> Result<TokenCache, OktaAuthError> {
     debug!("authorize: issuer={issuer} client_id={client_id} redirect_uri={redirect_uri}");
 
-    let auth_url = AuthUrl::new(format!("{issuer}/v1/authorize"))
-        .map_err(|e| OktaAuthError::InvalidUrl(e.to_string()))?;
-    let token_url = TokenUrl::new(format!("{issuer}/v1/token"))
-        .map_err(|e| OktaAuthError::InvalidUrl(e.to_string()))?;
+    let auth_url =
+        AuthUrl::new(format!("{issuer}/v1/authorize")).map_err(|e| OktaAuthError::InvalidUrl(e.to_string()))?;
+    let token_url =
+        TokenUrl::new(format!("{issuer}/v1/token")).map_err(|e| OktaAuthError::InvalidUrl(e.to_string()))?;
 
     let client = BasicClient::new(ClientId::new(client_id.to_string()))
         .set_auth_uri(auth_url)
         .set_token_uri(token_url)
         .set_redirect_uri(
-            RedirectUrl::new(redirect_uri.to_string())
-                .map_err(|e| OktaAuthError::InvalidUrl(e.to_string()))?,
+            RedirectUrl::new(redirect_uri.to_string()).map_err(|e| OktaAuthError::InvalidUrl(e.to_string()))?,
         );
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
@@ -153,9 +151,7 @@ fn wait_for_callback(server: &tiny_http::Server) -> Result<(String, String), Okt
     to_code_and_state(code, state, error, error_description)
 }
 
-fn parse_query_params(
-    query: &str,
-) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+fn parse_query_params(query: &str) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
     let mut code = None;
     let mut state = None;
     let mut error = None;
