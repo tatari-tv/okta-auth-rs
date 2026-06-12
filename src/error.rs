@@ -72,6 +72,11 @@ mod tests {
                 OktaAuthError::CallbackTimeout,
                 "Timed out waiting for authentication callback",
             ),
+            (
+                OktaAuthError::NonInteractive,
+                "Okta token is missing or expired and no controlling terminal is available \
+                 (non-interactive session). Re-authenticate in a terminal first, then retry.",
+            ),
             (OktaAuthError::NoQueryParams, "No query parameters in callback"),
             (OktaAuthError::NoAuthCode, "No authorization code in callback"),
             (OktaAuthError::NoState, "No state parameter in callback"),

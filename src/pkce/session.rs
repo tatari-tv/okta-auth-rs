@@ -61,3 +61,6 @@ pub fn gui_likely_from_env() -> bool {
         true
     }
 }
+
+#[cfg(test)]
+mod tests;
