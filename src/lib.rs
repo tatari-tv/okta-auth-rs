@@ -261,9 +261,10 @@ mod tests {
         };
 
         let auth = OktaAuth::new(config);
-        // Should fail with InvalidUrl because issuer is garbage
+        // Config-error precedence: a garbage issuer must surface as InvalidUrl, not be
+        // masked as NonInteractive by the interactivity check (which runs after URL build).
         let result = auth.get_token();
-        assert!(result.is_err());
+        assert!(matches!(result, Err(OktaAuthError::InvalidUrl(_))));
     }
 
     #[test]
@@ -289,7 +290,9 @@ mod tests {
         };
 
         let auth = OktaAuth::new(config);
+        // Refresh fails (unreachable issuer) and falls through to authorize(), where the
+        // invalid redirect_uri surfaces as InvalidUrl - config error beats NonInteractive.
         let result = auth.get_token();
-        assert!(result.is_err());
+        assert!(matches!(result, Err(OktaAuthError::InvalidUrl(_))));
     }
 }

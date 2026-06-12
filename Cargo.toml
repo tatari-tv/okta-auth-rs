@@ -1,6 +1,6 @@
 [package]
 name = "okta-auth"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Scott Idler <scott.idler@tatari.tv>"]
 description = "Rust library for Okta OAuth2 PKCE authentication in CLI tools - browser login, token caching, and transparent refresh"
@@ -12,6 +12,7 @@ dirs = "6.0.0"
 log = "0.4.29"
 oauth2 = { version = "5.0.0", features = ["reqwest-blocking"] }
 open = "5.3.3"
+rustix = { version = "1.1.4", features = ["fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"

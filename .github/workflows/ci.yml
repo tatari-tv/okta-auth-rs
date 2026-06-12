@@ -13,3 +13,8 @@ jobs:
   ci:
     uses: tatari-tv/github-actions/.github/workflows/platform-standard-ci.yml@v5
     secrets: inherit
+    with:
+      # Pin the Rust toolchain so the "Rust Build" job runs in the ECR builder-base
+      # image. Left empty, that job uses the public rust:slim-bookworm image but still
+      # attaches ECR credentials, so its container login fails. Matches marquee.
+      rust-version: "1.96"
