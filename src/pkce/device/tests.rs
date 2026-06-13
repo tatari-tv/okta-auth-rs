@@ -84,3 +84,18 @@ fn malformed_error_body_is_failed() {
         Poll::Failed(OktaAuthError::TokenExchange(_))
     ));
 }
+
+#[test]
+fn device_form_includes_scope_when_present() {
+    let form = device_authorization_form("client", "openid email");
+    assert_eq!(form, vec![("client_id", "client"), ("scope", "openid email")]);
+}
+
+#[test]
+fn device_form_omits_scope_when_empty() {
+    // RFC 8628 §3.1: scope is OPTIONAL. An empty scope must be omitted entirely,
+    // never sent as `scope=""`.
+    let form = device_authorization_form("client", "");
+    assert_eq!(form, vec![("client_id", "client")]);
+    assert!(!form.iter().any(|(k, _)| *k == "scope"), "scope must not appear");
+}

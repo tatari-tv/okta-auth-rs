@@ -79,6 +79,7 @@ impl Opener for FakeOpener {
 struct FakeDeviceRunner {
     token: String,
     calls: Cell<usize>,
+    last_scope: RefCell<Option<String>>,
 }
 
 impl FakeDeviceRunner {
@@ -86,14 +87,16 @@ impl FakeDeviceRunner {
         Self {
             token: token.to_string(),
             calls: Cell::new(0),
+            last_scope: RefCell::new(None),
         }
     }
 }
 
 impl DeviceRunner for FakeDeviceRunner {
     fn run(&self, issuer: &str, client_id: &str, scope: &str) -> Result<TokenCache, OktaAuthError> {
-        let _ = (issuer, client_id, scope);
+        let _ = (issuer, client_id);
         self.calls.set(self.calls.get() + 1);
+        *self.last_scope.borrow_mut() = Some(scope.to_string());
         Ok(TokenCache {
             access_token: self.token.clone(),
             refresh_token: None,
@@ -244,12 +247,42 @@ fn inner<B: Binder, O: Opener, D: DeviceRunner, C: Clock, X>(
 where
     X: FnOnce(&str) -> Result<TokenCache, OktaAuthError>,
 {
+    inner_scoped(
+        csrf_secret,
+        "openid email",
+        ssh,
+        gui_likely,
+        has_tty,
+        binder,
+        opener,
+        device,
+        clock,
+        exchange,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_scoped<B: Binder, O: Opener, D: DeviceRunner, C: Clock, X>(
+    csrf_secret: &str,
+    scope: &str,
+    ssh: bool,
+    gui_likely: bool,
+    has_tty: bool,
+    binder: &B,
+    opener: &O,
+    device: &D,
+    clock: &C,
+    exchange: X,
+) -> Result<TokenCache, OktaAuthError>
+where
+    X: FnOnce(&str) -> Result<TokenCache, OktaAuthError>,
+{
     authorize_inner(
         "http://issuer/authorize",
         csrf_secret,
         "https://issuer.example/oauth2/default",
         "client",
-        "openid email",
+        scope,
         11313,
         ssh,
         gui_likely,
@@ -362,6 +395,67 @@ fn local_with_busy_port_falls_back_to_device_grant() {
     assert_eq!(token.access_token, "FALLBACK-TOKEN");
     assert_eq!(device.calls.get(), 1, "busy port falls back to the device grant");
     assert_eq!(opener.opens.get(), 0, "no browser opened when the port is busy");
+}
+
+#[test]
+fn headless_with_no_scopes_passes_empty_scope_to_device_grant() {
+    // authorize(..., &[]) joins to "" — exercise the headless path end to end and
+    // confirm that "" reaches the device runner (which then omits the form field;
+    // see device::tests::device_form_omits_scope_when_empty).
+    let binder = FakeBinder::none();
+    let opener = FakeOpener::new();
+    let device = FakeDeviceRunner::new("DEVICE-TOKEN");
+    let clock = FakeClock::new();
+
+    inner_scoped(
+        "STATE",
+        "", // no scopes
+        /* ssh */ true,
+        /* gui */ true,
+        /* has_tty */ true,
+        &binder,
+        &opener,
+        &device,
+        &clock,
+        panic_exchange,
+    )
+    .unwrap();
+
+    assert_eq!(device.calls.get(), 1, "headless must run the device grant");
+    assert_eq!(
+        device.last_scope.borrow().as_deref(),
+        Some(""),
+        "empty scope must flow through"
+    );
+}
+
+#[test]
+fn busy_port_fallback_with_no_scopes_passes_empty_scope_to_device_grant() {
+    let binder = FakeBinder::none(); // bind returns None: port held -> device fallback
+    let opener = FakeOpener::new();
+    let device = FakeDeviceRunner::new("FALLBACK-TOKEN");
+    let clock = FakeClock::new();
+
+    inner_scoped(
+        "STATE",
+        "", // no scopes
+        /* ssh */ false,
+        /* gui */ true,
+        /* has_tty */ true,
+        &binder,
+        &opener,
+        &device,
+        &clock,
+        panic_exchange,
+    )
+    .unwrap();
+
+    assert_eq!(device.calls.get(), 1, "busy port falls back to the device grant");
+    assert_eq!(
+        device.last_scope.borrow().as_deref(),
+        Some(""),
+        "empty scope must flow through"
+    );
 }
 
 #[test]

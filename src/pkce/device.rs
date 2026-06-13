@@ -76,6 +76,17 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Build the device-authorization request form (RFC 8628 §3.1). `scope` is OPTIONAL,
+/// so when no scopes were requested we omit the field entirely rather than send
+/// `scope=""` (which some authorization servers reject or treat as a literal scope).
+fn device_authorization_form<'a>(client_id: &'a str, scope: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut form = vec![("client_id", client_id)];
+    if !scope.is_empty() {
+        form.push(("scope", scope));
+    }
+    form
+}
+
 /// Build a [`TokenCache`] from a successful device-grant token response.
 fn token_cache_from_success(success: TokenSuccess, now: u64) -> TokenCache {
     let expires_at = now + success.expires_in.unwrap_or(DEFAULT_TOKEN_TTL_SECS);
@@ -146,7 +157,7 @@ fn run(issuer: &str, client_id: &str, scope: &str) -> Result<TokenCache, OktaAut
     // Step 1: request a device + user code.
     let response = http
         .post(device_url.as_str())
-        .form(&[("client_id", client_id), ("scope", scope)])
+        .form(&device_authorization_form(client_id, scope))
         .send()
         .map_err(|e| OktaAuthError::DeviceFlow(format!("device authorization request failed: {e}")))?;
     let status = response.status();
