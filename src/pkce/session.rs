@@ -1,24 +1,41 @@
 //! Session classification: decide whether interactive auth is possible, and if so
-//! whether to open a local browser or fall back to the paste path.
+//! whether to use the local browser-redirect flow or the device authorization grant.
 
 use log::debug;
 
-/// How the current process can reach a human for the OAuth2 callback.
+/// How the current process can complete an OAuth2 login.
 ///
-/// The classification is *cosmetic* for the auth outcome: `Local` vs `Headless`
-/// only decides whether to call `open::that()` and which guidance to print. Auth
-/// can succeed in either via the listener or the paste path. Only `NonInteractive`
-/// changes the result (it fails fast).
+/// `Local` vs `Headless` selects the *flow*: a local GUI session uses the
+/// browser-redirect flow (auto-capture on the loopback listener); anything headless
+/// (SSH, no GUI) uses the device authorization grant (show a code, poll for approval),
+/// which needs nothing delivered back to this host. `NonInteractive` fails fast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Session {
     /// A controlling terminal and a local GUI are both available: open the browser
-    /// and auto-capture the callback; the paste path is a silent fallback.
+    /// and auto-capture the callback on `127.0.0.1:<port>`. Zero-touch.
     Local,
-    /// A controlling terminal is available but no local GUI (SSH, or no DISPLAY):
-    /// do not open a browser; print the URL and accept a pasted callback.
+    /// A controlling terminal is available but no local GUI (SSH, or no DISPLAY): use
+    /// the device authorization grant - print a code and poll, no listener or redirect.
     Headless,
     /// No controlling terminal: interactive auth is impossible, fail fast.
     NonInteractive,
+}
+
+/// Whether the controlling terminal (`/dev/tty` on Unix) is reachable. This is the
+/// interactivity signal fed to [`classify`] as `has_tty` - *not* `stdin().is_terminal()`,
+/// which misfires when stdin is a pipe but a terminal is attached.
+#[cfg(unix)]
+pub fn controlling_terminal_available() -> bool {
+    let available = std::fs::OpenOptions::new().read(true).open("/dev/tty").is_ok();
+    debug!("controlling_terminal_available: /dev/tty readable={available}");
+    available
+}
+
+/// Windows fallback: best-effort terminal check via stdin.
+#[cfg(windows)]
+pub fn controlling_terminal_available() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }
 
 /// Pure classifier so the decision is unit-testable without touching the world.

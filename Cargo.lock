@@ -678,13 +678,12 @@ dependencies = [
 
 [[package]]
 name = "okta-auth"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dirs",
  "log",
  "oauth2",
  "open",
- "rustix",
  "serde",
  "serde_json",
  "serial_test",
