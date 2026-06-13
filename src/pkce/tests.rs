@@ -29,48 +29,6 @@ impl Listener for FakeListener {
     }
 }
 
-struct FakeInput {
-    script: VecDeque<io::Result<ReadOutcome>>,
-}
-
-impl FakeInput {
-    fn new(script: Vec<io::Result<ReadOutcome>>) -> Self {
-        Self {
-            script: script.into_iter().collect(),
-        }
-    }
-}
-
-impl Input for FakeInput {
-    fn read_available(&mut self) -> io::Result<ReadOutcome> {
-        self.script.pop_front().unwrap_or(Ok(ReadOutcome::Pending))
-    }
-}
-
-struct FakeInputSource {
-    reader: RefCell<Option<FakeInput>>,
-}
-
-impl FakeInputSource {
-    fn with(reader: FakeInput) -> Self {
-        Self {
-            reader: RefCell::new(Some(reader)),
-        }
-    }
-    fn none() -> Self {
-        Self {
-            reader: RefCell::new(None),
-        }
-    }
-}
-
-impl InputSource for FakeInputSource {
-    type Reader = FakeInput;
-    fn acquire(&self) -> Option<FakeInput> {
-        self.reader.borrow_mut().take()
-    }
-}
-
 struct FakeBinder {
     listener: RefCell<Option<FakeListener>>,
     binds: Cell<usize>,
@@ -117,6 +75,45 @@ impl Opener for FakeOpener {
     }
 }
 
+/// A device runner that records calls and returns a fixed token.
+struct FakeDeviceRunner {
+    token: String,
+    calls: Cell<usize>,
+    last_scope: RefCell<Option<String>>,
+}
+
+impl FakeDeviceRunner {
+    fn new(token: &str) -> Self {
+        Self {
+            token: token.to_string(),
+            calls: Cell::new(0),
+            last_scope: RefCell::new(None),
+        }
+    }
+}
+
+impl DeviceRunner for FakeDeviceRunner {
+    fn run(&self, issuer: &str, client_id: &str, scope: &str) -> Result<TokenCache, OktaAuthError> {
+        let _ = (issuer, client_id);
+        self.calls.set(self.calls.get() + 1);
+        *self.last_scope.borrow_mut() = Some(scope.to_string());
+        Ok(TokenCache {
+            access_token: self.token.clone(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+        })
+    }
+}
+
+/// A device runner that must never be invoked (asserts the path didn't fall into it).
+struct PanicDeviceRunner;
+
+impl DeviceRunner for PanicDeviceRunner {
+    fn run(&self, _: &str, _: &str, _: &str) -> Result<TokenCache, OktaAuthError> {
+        panic!("device grant must not run on this path")
+    }
+}
+
 struct FakeClock {
     elapsed: Cell<Duration>,
     sleeps: Cell<usize>,
@@ -159,164 +156,13 @@ fn okta_error_capture() -> Capture {
     })
 }
 
-fn paste_line(query: &str) -> io::Result<ReadOutcome> {
-    Ok(ReadOutcome::Line(format!("http://local.test:11313/callback?{query}")))
-}
-
-fn run<L: Listener, I: Input>(
-    server: Option<L>,
-    input: &mut I,
+fn run_local<L: Listener>(
+    server: &L,
     clock: &FakeClock,
-    headless: bool,
     backstop: Duration,
 ) -> Result<(String, String), OktaAuthError> {
-    run_loop(server, input, clock, headless, backstop, POLL)
+    local_loop(server, clock, backstop, POLL)
 }
-
-// ---------------------------------------------------------------------------
-// run_loop arm coverage.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn listener_callback_wins() {
-    let server = FakeListener::new(vec![Ok(Some(code_capture()))]);
-    let mut input = FakeInput::new(vec![]); // always Pending
-    let clock = FakeClock::new();
-    let result = run(Some(server), &mut input, &clock, false, LONG_BACKSTOP).unwrap();
-    assert_eq!(result, ("CODE".into(), "STATE".into()));
-}
-
-#[test]
-fn paste_wins() {
-    let mut input = FakeInput::new(vec![paste_line("code=CODE&state=STATE")]);
-    let clock = FakeClock::new();
-    let result = run(None::<FakeListener>, &mut input, &clock, true, LONG_BACKSTOP).unwrap();
-    assert_eq!(result, ("CODE".into(), "STATE".into()));
-}
-
-#[test]
-fn listener_okta_error_surfaces_immediately() {
-    let server = FakeListener::new(vec![Ok(Some(okta_error_capture()))]);
-    let mut input = FakeInput::new(vec![]);
-    let clock = FakeClock::new();
-    let err = run(Some(server), &mut input, &clock, false, LONG_BACKSTOP).unwrap_err();
-    assert!(matches!(err, OktaAuthError::OktaError { .. }));
-}
-
-#[test]
-fn pasted_okta_error_surfaces_in_headless() {
-    let mut input = FakeInput::new(vec![paste_line("error=access_denied&error_description=nope")]);
-    let clock = FakeClock::new();
-    let err = run(None::<FakeListener>, &mut input, &clock, true, LONG_BACKSTOP).unwrap_err();
-    assert!(matches!(err, OktaAuthError::OktaError { .. }));
-}
-
-#[test]
-fn pasted_okta_error_surfaces_in_local() {
-    let mut input = FakeInput::new(vec![paste_line("error=access_denied")]);
-    let clock = FakeClock::new();
-    let err = run(None::<FakeListener>, &mut input, &clock, false, LONG_BACKSTOP).unwrap_err();
-    assert!(matches!(err, OktaAuthError::OktaError { .. }));
-}
-
-#[test]
-fn stray_no_code_request_is_ignored() {
-    let server = FakeListener::new(vec![Ok(Some(Capture::Ignore)), Ok(Some(code_capture()))]);
-    let mut input = FakeInput::new(vec![]);
-    let clock = FakeClock::new();
-    let result = run(Some(server), &mut input, &clock, false, LONG_BACKSTOP).unwrap();
-    assert_eq!(result, ("CODE".into(), "STATE".into()));
-}
-
-#[test]
-fn transient_listener_error_does_not_kill_login() {
-    let server = FakeListener::new(vec![
-        Err(io::Error::other("transient accept failure")),
-        Ok(Some(code_capture())),
-    ]);
-    let mut input = FakeInput::new(vec![]);
-    let clock = FakeClock::new();
-    let result = run(Some(server), &mut input, &clock, false, LONG_BACKSTOP).unwrap();
-    assert_eq!(result, ("CODE".into(), "STATE".into()));
-}
-
-#[test]
-fn bad_paste_is_retryable_in_headless() {
-    let mut input = FakeInput::new(vec![
-        Ok(ReadOutcome::Line("garbage no query".into())),
-        paste_line("code=CODE&state=STATE"),
-    ]);
-    let clock = FakeClock::new();
-    let result = run(None::<FakeListener>, &mut input, &clock, true, LONG_BACKSTOP).unwrap();
-    assert_eq!(result, ("CODE".into(), "STATE".into()));
-}
-
-#[test]
-fn bad_paste_is_silent_in_local() {
-    let mut input = FakeInput::new(vec![
-        Ok(ReadOutcome::Line("garbage no query".into())),
-        paste_line("code=CODE&state=STATE"),
-    ]);
-    let clock = FakeClock::new();
-    let result = run(None::<FakeListener>, &mut input, &clock, false, LONG_BACKSTOP).unwrap();
-    assert_eq!(result, ("CODE".into(), "STATE".into()));
-}
-
-#[test]
-fn overflow_is_non_fatal_and_retryable() {
-    let mut input = FakeInput::new(vec![Ok(ReadOutcome::Overflow), paste_line("code=CODE&state=STATE")]);
-    let clock = FakeClock::new();
-    let result = run(None::<FakeListener>, &mut input, &clock, true, LONG_BACKSTOP).unwrap();
-    assert_eq!(result, ("CODE".into(), "STATE".into()));
-}
-
-#[test]
-fn tty_eof_stops_paste_but_listener_still_wins() {
-    let server = FakeListener::new(vec![Ok(None), Ok(Some(code_capture()))]);
-    let mut input = FakeInput::new(vec![Ok(ReadOutcome::Eof)]);
-    let clock = FakeClock::new();
-    let result = run(Some(server), &mut input, &clock, true, LONG_BACKSTOP).unwrap();
-    assert_eq!(result, ("CODE".into(), "STATE".into()));
-}
-
-#[test]
-fn backstop_fires_when_nothing_arrives() {
-    let mut input = FakeInput::new(vec![]); // always Pending
-    let clock = FakeClock::new();
-    // 75ms per sleep, 200ms backstop -> fires after a few scans.
-    let err = run(
-        None::<FakeListener>,
-        &mut input,
-        &clock,
-        true,
-        Duration::from_millis(200),
-    )
-    .unwrap_err();
-    assert!(matches!(err, OktaAuthError::CallbackTimeout));
-    assert!(
-        clock.sleeps.get() >= 1,
-        "loop must sleep between idle scans, not busy-wait"
-    );
-}
-
-#[test]
-fn server_none_reads_tty_without_busy_waiting() {
-    // bind-failed path: no listener, paste arrives after two idle scans.
-    let mut input = FakeInput::new(vec![
-        Ok(ReadOutcome::Pending),
-        Ok(ReadOutcome::Pending),
-        paste_line("code=CODE&state=STATE"),
-    ]);
-    let clock = FakeClock::new();
-    let result = run(None::<FakeListener>, &mut input, &clock, true, LONG_BACKSTOP).unwrap();
-    assert_eq!(result, ("CODE".into(), "STATE".into()));
-    // Exactly one sleep per idle scan: proves it yields rather than spinning.
-    assert_eq!(clock.sleeps.get(), 2);
-}
-
-// ---------------------------------------------------------------------------
-// authorize_inner: classification, bind/open gating, CSRF.
-// ---------------------------------------------------------------------------
 
 fn ok_exchange(code: &str) -> Result<TokenCache, OktaAuthError> {
     Ok(TokenCache {
@@ -330,25 +176,143 @@ fn panic_exchange(code: &str) -> Result<TokenCache, OktaAuthError> {
     panic!("exchange must not run (got code={code})")
 }
 
-#[test]
-fn non_interactive_fails_fast_without_binding_or_opening() {
-    let binder = FakeBinder::none();
-    let opener = FakeOpener::new();
-    let source = FakeInputSource::none(); // no controlling terminal
-    let clock = FakeClock::new();
+// ---------------------------------------------------------------------------
+// local_loop arm coverage.
+// ---------------------------------------------------------------------------
 
-    let result = authorize_inner(
+#[test]
+fn listener_callback_wins() {
+    let server = FakeListener::new(vec![Ok(Some(code_capture()))]);
+    let clock = FakeClock::new();
+    let result = run_local(&server, &clock, LONG_BACKSTOP).unwrap();
+    assert_eq!(result, ("CODE".into(), "STATE".into()));
+}
+
+#[test]
+fn listener_okta_error_surfaces_immediately() {
+    let server = FakeListener::new(vec![Ok(Some(okta_error_capture()))]);
+    let clock = FakeClock::new();
+    let err = run_local(&server, &clock, LONG_BACKSTOP).unwrap_err();
+    assert!(matches!(err, OktaAuthError::OktaError { .. }));
+}
+
+#[test]
+fn stray_no_code_request_is_ignored() {
+    let server = FakeListener::new(vec![Ok(Some(Capture::Ignore)), Ok(Some(code_capture()))]);
+    let clock = FakeClock::new();
+    let result = run_local(&server, &clock, LONG_BACKSTOP).unwrap();
+    assert_eq!(result, ("CODE".into(), "STATE".into()));
+}
+
+#[test]
+fn transient_listener_error_does_not_kill_login() {
+    let server = FakeListener::new(vec![
+        Err(io::Error::other("transient accept failure")),
+        Ok(Some(code_capture())),
+    ]);
+    let clock = FakeClock::new();
+    let result = run_local(&server, &clock, LONG_BACKSTOP).unwrap();
+    assert_eq!(result, ("CODE".into(), "STATE".into()));
+}
+
+#[test]
+fn backstop_fires_when_nothing_arrives() {
+    let server = FakeListener::new(vec![]); // always Ok(None)
+    let clock = FakeClock::new();
+    // 75ms per sleep, 200ms backstop -> fires after a few scans.
+    let err = run_local(&server, &clock, Duration::from_millis(200)).unwrap_err();
+    assert!(matches!(err, OktaAuthError::CallbackTimeout));
+    assert!(
+        clock.sleeps.get() >= 1,
+        "loop must sleep between idle scans, not busy-wait"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// authorize_inner: classification and dispatch.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn inner<B: Binder, O: Opener, D: DeviceRunner, C: Clock, X>(
+    csrf_secret: &str,
+    ssh: bool,
+    gui_likely: bool,
+    has_tty: bool,
+    binder: &B,
+    opener: &O,
+    device: &D,
+    clock: &C,
+    exchange: X,
+) -> Result<TokenCache, OktaAuthError>
+where
+    X: FnOnce(&str) -> Result<TokenCache, OktaAuthError>,
+{
+    inner_scoped(
+        csrf_secret,
+        "openid email",
+        ssh,
+        gui_likely,
+        has_tty,
+        binder,
+        opener,
+        device,
+        clock,
+        exchange,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_scoped<B: Binder, O: Opener, D: DeviceRunner, C: Clock, X>(
+    csrf_secret: &str,
+    scope: &str,
+    ssh: bool,
+    gui_likely: bool,
+    has_tty: bool,
+    binder: &B,
+    opener: &O,
+    device: &D,
+    clock: &C,
+    exchange: X,
+) -> Result<TokenCache, OktaAuthError>
+where
+    X: FnOnce(&str) -> Result<TokenCache, OktaAuthError>,
+{
+    authorize_inner(
         "http://issuer/authorize",
-        "STATE",
+        csrf_secret,
+        "https://issuer.example/oauth2/default",
+        "client",
+        scope,
         11313,
-        /* ssh */ false,
-        /* gui_likely */ true,
-        &binder,
-        &opener,
-        &source,
-        &clock,
+        ssh,
+        gui_likely,
+        has_tty,
+        binder,
+        opener,
+        device,
+        clock,
         LONG_BACKSTOP,
         POLL,
+        exchange,
+    )
+}
+
+#[test]
+fn non_interactive_fails_fast_without_binding_opening_or_device() {
+    let binder = FakeBinder::none();
+    let opener = FakeOpener::new();
+    let device = PanicDeviceRunner;
+    let clock = FakeClock::new();
+
+    let result = inner(
+        "STATE",
+        /* ssh */ false,
+        /* gui */ true,
+        /* has_tty */ false,
+        &binder,
+        &opener,
+        &device,
+        &clock,
         panic_exchange,
     );
 
@@ -358,105 +322,161 @@ fn non_interactive_fails_fast_without_binding_or_opening() {
 }
 
 #[test]
-fn local_session_opens_browser_and_completes() {
-    let binder = FakeBinder::none(); // bind-failed -> paste-only
-    let opener = FakeOpener::new();
-    let source = FakeInputSource::with(FakeInput::new(vec![paste_line("code=CODE&state=STATE")]));
-    let clock = FakeClock::new();
-
-    let token = authorize_inner(
-        "http://issuer/authorize",
-        "STATE",
-        11313,
-        /* ssh */ false,
-        /* gui_likely */ true, // -> Local
-        &binder,
-        &opener,
-        &source,
-        &clock,
-        LONG_BACKSTOP,
-        POLL,
-        ok_exchange,
-    )
-    .unwrap();
-
-    assert_eq!(token.access_token, "tok-CODE");
-    assert_eq!(opener.opens.get(), 1, "Local must open the browser");
-}
-
-#[test]
-fn headless_session_does_not_open_browser() {
+fn headless_session_uses_device_grant() {
     let binder = FakeBinder::none();
     let opener = FakeOpener::new();
-    let source = FakeInputSource::with(FakeInput::new(vec![paste_line("code=CODE&state=STATE")]));
+    let device = FakeDeviceRunner::new("DEVICE-TOKEN");
     let clock = FakeClock::new();
 
-    let token = authorize_inner(
-        "http://issuer/authorize",
+    let token = inner(
         "STATE",
-        11313,
-        /* ssh */ true, // -> Headless
-        /* gui_likely */ true,
+        /* ssh */ true,
+        /* gui */ true,
+        /* has_tty */ true,
         &binder,
         &opener,
-        &source,
+        &device,
         &clock,
-        LONG_BACKSTOP,
-        POLL,
-        ok_exchange,
+        panic_exchange,
     )
     .unwrap();
 
-    assert_eq!(token.access_token, "tok-CODE");
-    assert_eq!(opener.opens.get(), 0, "Headless must not open the browser");
+    assert_eq!(token.access_token, "DEVICE-TOKEN");
+    assert_eq!(device.calls.get(), 1, "headless must run the device grant");
+    assert_eq!(binder.binds.get(), 0, "headless must not bind a listener");
+    assert_eq!(opener.opens.get(), 0, "headless must not open a browser");
 }
 
 #[test]
-fn bound_listener_capture_completes_through_authorize_inner() {
+fn local_session_opens_browser_and_completes_via_listener() {
     let binder = FakeBinder::with(FakeListener::new(vec![Ok(Some(code_capture()))]));
     let opener = FakeOpener::new();
-    let source = FakeInputSource::with(FakeInput::new(vec![])); // tty present, always Pending
+    let device = PanicDeviceRunner;
     let clock = FakeClock::new();
 
-    let token = authorize_inner(
-        "http://issuer/authorize",
+    let token = inner(
         "STATE",
-        11313,
-        /* ssh */ true, // Headless: no browser, listener (e.g. ssh -L tunnel) still captures
-        /* gui_likely */ false,
+        /* ssh */ false,
+        /* gui */ true,
+        /* has_tty */ true,
         &binder,
         &opener,
-        &source,
+        &device,
         &clock,
-        LONG_BACKSTOP,
-        POLL,
         ok_exchange,
     )
     .unwrap();
 
     assert_eq!(token.access_token, "tok-CODE");
-    assert_eq!(binder.binds.get(), 1, "interactive session binds the listener");
+    assert_eq!(binder.binds.get(), 1, "local binds the listener");
+    assert_eq!(opener.opens.get(), 1, "local opens the browser");
 }
 
 #[test]
-fn wrong_pasted_state_is_fatal_csrf_mismatch() {
-    let binder = FakeBinder::none();
+fn local_with_busy_port_falls_back_to_device_grant() {
+    let binder = FakeBinder::none(); // bind returns None: port held
     let opener = FakeOpener::new();
-    let source = FakeInputSource::with(FakeInput::new(vec![paste_line("code=CODE&state=WRONG")]));
+    let device = FakeDeviceRunner::new("FALLBACK-TOKEN");
     let clock = FakeClock::new();
 
-    let result = authorize_inner(
-        "http://issuer/authorize",
-        "STATE", // session csrf secret
-        11313,
+    let token = inner(
+        "STATE",
+        /* ssh */ false,
+        /* gui */ true,
+        /* has_tty */ true,
+        &binder,
+        &opener,
+        &device,
+        &clock,
+        panic_exchange,
+    )
+    .unwrap();
+
+    assert_eq!(token.access_token, "FALLBACK-TOKEN");
+    assert_eq!(device.calls.get(), 1, "busy port falls back to the device grant");
+    assert_eq!(opener.opens.get(), 0, "no browser opened when the port is busy");
+}
+
+#[test]
+fn headless_with_no_scopes_passes_empty_scope_to_device_grant() {
+    // authorize(..., &[]) joins to "" — exercise the headless path end to end and
+    // confirm that "" reaches the device runner (which then omits the form field;
+    // see device::tests::device_form_omits_scope_when_empty).
+    let binder = FakeBinder::none();
+    let opener = FakeOpener::new();
+    let device = FakeDeviceRunner::new("DEVICE-TOKEN");
+    let clock = FakeClock::new();
+
+    inner_scoped(
+        "STATE",
+        "", // no scopes
+        /* ssh */ true,
+        /* gui */ true,
+        /* has_tty */ true,
+        &binder,
+        &opener,
+        &device,
+        &clock,
+        panic_exchange,
+    )
+    .unwrap();
+
+    assert_eq!(device.calls.get(), 1, "headless must run the device grant");
+    assert_eq!(
+        device.last_scope.borrow().as_deref(),
+        Some(""),
+        "empty scope must flow through"
+    );
+}
+
+#[test]
+fn busy_port_fallback_with_no_scopes_passes_empty_scope_to_device_grant() {
+    let binder = FakeBinder::none(); // bind returns None: port held -> device fallback
+    let opener = FakeOpener::new();
+    let device = FakeDeviceRunner::new("FALLBACK-TOKEN");
+    let clock = FakeClock::new();
+
+    inner_scoped(
+        "STATE",
+        "", // no scopes
+        /* ssh */ false,
+        /* gui */ true,
+        /* has_tty */ true,
+        &binder,
+        &opener,
+        &device,
+        &clock,
+        panic_exchange,
+    )
+    .unwrap();
+
+    assert_eq!(device.calls.get(), 1, "busy port falls back to the device grant");
+    assert_eq!(
+        device.last_scope.borrow().as_deref(),
+        Some(""),
+        "empty scope must flow through"
+    );
+}
+
+#[test]
+fn wrong_callback_state_is_fatal_csrf_mismatch() {
+    let binder = FakeBinder::with(FakeListener::new(vec![Ok(Some(Capture::Code(
+        "CODE".into(),
+        "WRONG".into(),
+    )))]));
+    let opener = FakeOpener::new();
+    let device = PanicDeviceRunner;
+    let clock = FakeClock::new();
+
+    let result = inner(
+        "STATE", // session csrf secret; listener returned WRONG
         false,
+        true,
         true,
         &binder,
         &opener,
-        &source,
+        &device,
         &clock,
-        LONG_BACKSTOP,
-        POLL,
         panic_exchange, // exchange must NOT run on a CSRF mismatch
     );
 
@@ -468,7 +488,7 @@ fn wrong_pasted_state_is_fatal_csrf_mismatch() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn bad_issuer_surfaces_invalid_url_before_any_interactivity_check() {
+fn bad_issuer_surfaces_invalid_url_before_any_session_check() {
     // authorize() builds/validates URLs first, so a garbage issuer is InvalidUrl
     // regardless of session - and no network/bind/open happens.
     let result = authorize("not a valid url", "client", "http://127.0.0.1:11313/callback", &[]);

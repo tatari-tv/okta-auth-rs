@@ -4,13 +4,12 @@ pub enum OktaAuthError {
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
 
-    /// The callback listener could not bind its port. Since binding now runs only
-    /// in an interactive session (after the `NonInteractive` early-return), this is
-    /// never fatal: the flow falls back to the paste path with `server = None`.
-    /// Nothing constructs this variant after the headless-auth redesign; it is
-    /// retained so external consumers matching on it do not break (removing it
-    /// would be a second SemVer-breaking change in the same release).
-    #[deprecated(note = "bind failure is now non-fatal; the flow falls back to the paste path")]
+    /// The callback listener could not bind its port. This is never fatal: the local
+    /// flow falls back to the device authorization grant, which needs no listener.
+    /// Nothing constructs this variant after the device-grant redesign; it is retained
+    /// so external consumers matching on it do not break (removing it would be a
+    /// SemVer-breaking change).
+    #[deprecated(note = "bind failure is now non-fatal; the flow falls back to the device grant")]
     #[error("Failed to bind to {addr}: another login may be running: {source}")]
     BindFailed {
         addr: String,
@@ -43,6 +42,9 @@ pub enum OktaAuthError {
 
     #[error("Token exchange failed: {0}")]
     TokenExchange(String),
+
+    #[error("Device authorization failed: {0}")]
+    DeviceFlow(String),
 
     #[error("Refresh token exchange failed: {0}")]
     RefreshFailed(String),

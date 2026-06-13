@@ -1,20 +1,21 @@
-//! The OAuth2 PKCE "localhost redirect" flow, reworked for non-blocking
-//! headless/SSH authentication.
+//! The OAuth2 authorization flow, split by session type.
 //!
-//! Instead of binding the callback listener and then blocking on a fixed 60s
-//! timeout before offering a paste fallback, `authorize()` now:
+//! `authorize()`:
 //!   1. validates config / builds the authorize URL first (so a malformed config
-//!      still surfaces as `InvalidUrl`, not masked by interactivity);
+//!      surfaces as `InvalidUrl`, not masked by the session check);
 //!   2. classifies the session (Local / Headless / NonInteractive);
-//!   3. fails fast with `NonInteractive` before binding or opening anything;
-//!   4. binds an `Option<Server>` (bind failure is non-fatal when interactive) and
-//!      opens the browser only when `Local`;
-//!   5. runs a single-threaded readiness loop that races the listener against
-//!      paste input read from the controlling terminal - whichever yields a
-//!      `(code, state)` first wins.
+//!   3. dispatches:
+//!      - **Local** (at the machine, GUI present): the classic localhost-redirect PKCE
+//!        flow - open the browser, auto-capture the callback on `127.0.0.1:<port>`.
+//!        Zero-touch, unchanged.
+//!      - **Headless** (SSH, or no GUI): the **device authorization grant** - show a
+//!        short code, poll for approval. No listener, no redirect, no paste; works the
+//!        same locally and remotely. If the local callback port is somehow busy, Local
+//!        also falls back to this.
+//!      - **NonInteractive** (no controlling terminal: CI, agent shell): fail fast.
 
 mod clock;
-mod input;
+mod device;
 mod listener;
 mod session;
 
@@ -30,22 +31,15 @@ use oauth2::{
 use crate::OktaAuthError;
 use crate::cache::TokenCache;
 use clock::{Clock, RealClock};
-use input::{Input, InputSource, ReadOutcome, TtySource};
-use listener::{Capture, HttpListener, Listener, parse_callback_url};
-use session::{Session, classify, gui_likely_from_env, ssh_from_env};
+use listener::{Capture, HttpListener, Listener};
+use session::{Session, classify, controlling_terminal_available, gui_likely_from_env, ssh_from_env};
 
-/// How often the readiness loop yields between idle scans. Both sources are read
-/// non-blocking; this sleep keeps the loop from busy-waiting. Anything in the
-/// 50-100ms range keeps capture latency sub-second.
+/// How often the local redirect loop polls the listener between idle scans.
 const POLL_INTERVAL: Duration = Duration::from_millis(75);
 
-/// A generous backstop so a wedged pty-wrapped process can't hang forever. Paste is
-/// instant, so a human never hits it; it is not the primary control path.
-const BACKSTOP_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Upper bound on the paste carry buffer: a single line exceeding this without a
-/// newline is discarded rather than growing unbounded (no OOM from a runaway pipe).
-const MAX_PASTE: usize = 8 * 1024;
+/// A generous backstop for the local browser flow: the user is at the machine
+/// clicking through, so this only guards against a wedged process.
+const LOCAL_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Binds the callback listener. Injected so tests can supply a fake.
 trait Binder {
@@ -56,6 +50,12 @@ trait Binder {
 /// Launches the system browser. Injected so tests can supply a no-op.
 trait Opener {
     fn open(&self, url: &str);
+}
+
+/// Runs the device authorization grant. Injected so tests can supply a fake without
+/// hitting Okta.
+trait DeviceRunner {
+    fn run(&self, issuer: &str, client_id: &str, scope: &str) -> Result<TokenCache, OktaAuthError>;
 }
 
 /// Production binder: a real `tiny_http` listener on `127.0.0.1:<port>`.
@@ -89,7 +89,7 @@ pub fn authorize(
     debug!("authorize: issuer={issuer} client_id={client_id} redirect_uri={redirect_uri}");
 
     // Step 1: build/validate URLs FIRST so a malformed config surfaces as
-    // `InvalidUrl` rather than being masked by the interactivity check below.
+    // `InvalidUrl` rather than being masked by the session check below.
     let auth_url =
         AuthUrl::new(format!("{issuer}/v1/authorize")).map_err(|e| OktaAuthError::InvalidUrl(e.to_string()))?;
     let token_url =
@@ -113,8 +113,9 @@ pub fn authorize(
     let parsed = Url::parse(redirect_uri).map_err(|e| OktaAuthError::InvalidUrl(e.to_string()))?;
     let port = parsed.port().unwrap_or(80);
 
-    // The token exchange stays at this boundary so the inner loop can be unit-tested
-    // without hitting Okta. It captures the client and PKCE verifier.
+    // The token exchange for the LOCAL (authorization-code) path stays at this boundary
+    // so the inner loop can be unit-tested without hitting Okta. It captures the client
+    // and PKCE verifier. The device path does its own token poll and never uses this.
     let exchange = move |code: &str| -> Result<TokenCache, OktaAuthError> {
         info!("authorize: exchanging authorization code for tokens");
         let token_response = client
@@ -125,35 +126,45 @@ pub fn authorize(
         Ok(token_cache_from_response(&token_response))
     };
 
+    let scope = scopes.join(" ");
+
     authorize_inner(
         authorize_url.as_str(),
         csrf_state.secret(),
+        issuer,
+        client_id,
+        &scope,
         port,
         ssh_from_env(),
         gui_likely_from_env(),
+        controlling_terminal_available(),
         &HttpBinder,
         &SystemOpener,
-        &TtySource::new(MAX_PASTE),
+        &device::HttpDeviceRunner,
         &RealClock::new(),
-        BACKSTOP_TIMEOUT,
+        LOCAL_CALLBACK_TIMEOUT,
         POLL_INTERVAL,
         exchange,
     )
 }
 
-/// The world-injected core of `authorize()`. Classifies the session, fails fast on
-/// `NonInteractive` (before binding/opening), binds + opens per classification, runs
-/// the readiness loop, verifies CSRF state, then exchanges the code.
+/// The world-injected core of `authorize()`. Classifies the session and dispatches:
+/// `NonInteractive` fails fast; `Headless` runs the device grant; `Local` binds the
+/// listener, opens the browser, captures the callback, verifies CSRF, and exchanges.
 #[allow(clippy::too_many_arguments)]
-fn authorize_inner<B, O, S, C, X>(
+fn authorize_inner<B, O, D, C, X>(
     authorize_url: &str,
     csrf_secret: &str,
+    issuer: &str,
+    client_id: &str,
+    scope: &str,
     port: u16,
     ssh: bool,
     gui_likely: bool,
+    has_tty: bool,
     binder: &B,
     opener: &O,
-    input_source: &S,
+    device: &D,
     clock: &C,
     backstop: Duration,
     poll_interval: Duration,
@@ -162,131 +173,74 @@ fn authorize_inner<B, O, S, C, X>(
 where
     B: Binder,
     O: Opener,
-    S: InputSource,
+    D: DeviceRunner,
     C: Clock,
     X: FnOnce(&str) -> Result<TokenCache, OktaAuthError>,
 {
-    // Step 2: classify by whether the controlling terminal is reachable. Acquiring
-    // the input source IS the reachability test (and acquires the source in one step).
-    let acquired = input_source.acquire();
-    let session = classify(acquired.is_some(), ssh, gui_likely);
+    let session = classify(has_tty, ssh, gui_likely);
 
-    // Step 3: NonInteractive fails fast, before binding or opening anything.
-    let headless = match session {
+    match session {
         Session::NonInteractive => {
-            debug!("authorize_inner: NonInteractive, failing fast before bind/open");
-            return Err(OktaAuthError::NonInteractive);
+            debug!("authorize_inner: NonInteractive, failing fast");
+            Err(OktaAuthError::NonInteractive)
         }
-        Session::Local => false,
-        Session::Headless => true,
-    };
-    let mut input = acquired.expect("interactive session must have an acquired controlling terminal");
-
-    // Step 4: bind (interactive only, so bind failure is never fatal) and open.
-    let server = binder.bind(port);
-
-    eprintln!("Open this URL to authenticate:");
-    eprintln!("{authorize_url}");
-    eprintln!();
-    if headless {
-        eprintln!("Open this on your machine. If it shows \"can't be reached\", paste the address-bar URL here:");
-        eprint!("> ");
-    } else {
-        opener.open(authorize_url);
-        eprintln!("Your browser should open automatically; if it doesn't, open the URL above.");
+        Session::Headless => {
+            info!("authorize_inner: headless session -> device authorization grant");
+            device.run(issuer, client_id, scope)
+        }
+        Session::Local => match binder.bind(port) {
+            Some(server) => {
+                info!("authorize_inner: local session -> browser redirect flow");
+                opener.open(authorize_url);
+                eprintln!("Opening your browser to sign in. If it doesn't open, visit:");
+                eprintln!("{authorize_url}");
+                let (code, state) = local_loop(&server, clock, backstop, poll_interval)?;
+                if state != csrf_secret {
+                    error!("authorize_inner: CSRF state mismatch - possible attack");
+                    return Err(OktaAuthError::CsrfMismatch);
+                }
+                exchange(&code)
+            }
+            None => {
+                // Local callback port held (e.g. a stale `ssh -L` tunnel): rather than
+                // fail, fall back to the device grant, which needs no listener.
+                warn!("authorize_inner: callback port busy; falling back to device grant");
+                device.run(issuer, client_id, scope)
+            }
+        },
     }
-
-    // Step 5: race the listener against pasted input.
-    let (code, state) = run_loop(server, &mut input, clock, headless, backstop, poll_interval)?;
-
-    // One CSRF check, then one token exchange - unchanged from before.
-    if state != csrf_secret {
-        error!("authorize_inner: CSRF state mismatch - possible attack");
-        return Err(OktaAuthError::CsrfMismatch);
-    }
-
-    exchange(&code)
 }
 
-/// The single-threaded readiness loop. Polls the listener and the terminal, both
-/// non-blocking, sleeping `poll_interval` between idle scans. First source to yield
-/// `(code, state)` wins. There is no background thread, so cancellation is free: when
-/// the listener wins we simply stop polling the tty.
-fn run_loop<L, I, C>(
-    server: Option<L>,
-    input: &mut I,
+/// The local browser flow's capture loop: poll the listener non-blocking until it
+/// yields a callback, a terminal Okta error, or the backstop fires.
+fn local_loop<L, C>(
+    server: &L,
     clock: &C,
-    headless: bool,
     backstop: Duration,
     poll_interval: Duration,
 ) -> Result<(String, String), OktaAuthError>
 where
     L: Listener,
-    I: Input,
     C: Clock,
 {
-    debug!(
-        "run_loop: headless={headless} have_listener={} backstop={backstop:?} poll_interval={poll_interval:?}",
-        server.is_some()
-    );
-    let mut tty_live = true;
+    debug!("local_loop: backstop={backstop:?} poll_interval={poll_interval:?}");
     loop {
-        // 1) Listener: non-blocking. A stray request is ignored; a real ?error= is
-        //    surfaced immediately rather than waited out to the backstop.
-        if let Some(ref server) = server {
-            match server.poll() {
-                Ok(Some(Capture::Code(code, state))) => {
-                    debug!("run_loop: listener won");
-                    return Ok((code, state));
-                }
-                Ok(Some(Capture::OktaError(e))) => {
-                    error!("run_loop: listener surfaced okta error: {e}");
-                    return Err(e);
-                }
-                Ok(Some(Capture::Ignore)) => trace!("run_loop: ignored stray request"),
-                Ok(None) => trace!("run_loop: no request pending"),
-                Err(e) => warn!("run_loop: listener poll failed: {e} (transient, continuing)"),
+        match server.poll() {
+            Ok(Some(Capture::Code(code, state))) => {
+                debug!("local_loop: listener captured callback");
+                return Ok((code, state));
             }
-        }
-
-        // 2) Terminal: non-blocking. A bad paste reprompts (Headless) or is silently
-        //    ignored (Local); a pasted ?error= is terminal and surfaces now.
-        if tty_live {
-            match input.read_available() {
-                Ok(ReadOutcome::Line(raw)) => match parse_callback_url(raw.trim()) {
-                    Ok((code, state)) => {
-                        debug!("run_loop: paste won");
-                        return Ok((code, state));
-                    }
-                    Err(e @ OktaAuthError::OktaError { .. }) => {
-                        error!("run_loop: pasted url surfaced okta error: {e}");
-                        return Err(e);
-                    }
-                    Err(_) if headless => {
-                        eprintln!("Couldn't parse that; paste the full callback URL:");
-                        eprint!("> ");
-                    }
-                    Err(_) => {} // Local: silently ignore junk, preserving zero-touch.
-                },
-                Ok(ReadOutcome::Overflow) if headless => {
-                    eprintln!("That input was too long; paste just the callback URL:");
-                    eprint!("> ");
-                }
-                Ok(ReadOutcome::Overflow) => {} // Local: silent.
-                Ok(ReadOutcome::Eof) => {
-                    debug!("run_loop: tty EOF, paste path closed (listener/backstop continue)");
-                    tty_live = false;
-                }
-                Ok(ReadOutcome::Pending) => {}
-                Err(e) => {
-                    warn!("run_loop: tty read failed: {e}; closing paste path");
-                    tty_live = false;
-                }
+            Ok(Some(Capture::OktaError(e))) => {
+                error!("local_loop: listener surfaced okta error: {e}");
+                return Err(e);
             }
+            Ok(Some(Capture::Ignore)) => trace!("local_loop: ignored stray request"),
+            Ok(None) => trace!("local_loop: no request pending"),
+            Err(e) => warn!("local_loop: listener poll failed: {e} (transient, continuing)"),
         }
 
         if clock.elapsed() >= backstop {
-            warn!("run_loop: backstop timeout reached");
+            warn!("local_loop: callback timeout reached");
             return Err(OktaAuthError::CallbackTimeout);
         }
         clock.sleep(poll_interval);

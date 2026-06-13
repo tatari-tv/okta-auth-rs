@@ -1,9 +1,9 @@
-//! The HTTP callback listener port and the query-string parsing shared by both the
-//! listener and the paste path.
+//! The HTTP callback listener port for the local browser-redirect flow, plus the
+//! query-string parsing it uses.
 //!
 //! The port yields parsed [`Capture`] outcomes rather than raw `tiny_http::Request`
-//! values, so the readiness loop (and its tests) never has to fabricate HTTP
-//! requests - it asserts against `Capture::{Code, OktaError, Ignore}`.
+//! values, so the capture loop (and its tests) never has to fabricate HTTP requests -
+//! it asserts against `Capture::{Code, OktaError, Ignore}`.
 
 use std::io;
 
@@ -39,8 +39,8 @@ pub struct HttpListener {
 
 impl HttpListener {
     /// Bind the callback listener. Returns `None` on bind failure (a held port, e.g.
-    /// a stale `ssh -L` tunnel): binding runs only in an interactive session, so the
-    /// paste path can carry the flow without the listener.
+    /// a stale `ssh -L` tunnel): the caller then falls back to the device grant, which
+    /// needs no listener.
     pub fn bind(port: u16) -> Option<Self> {
         let bind_addr = format!("127.0.0.1:{port}");
         match tiny_http::Server::http(&bind_addr) {
@@ -49,7 +49,7 @@ impl HttpListener {
                 Some(Self { server })
             }
             Err(e) => {
-                log::warn!("HttpListener::bind: could not bind {bind_addr}: {e} (paste-only fallback)");
+                log::warn!("HttpListener::bind: could not bind {bind_addr}: {e} (device-grant fallback)");
                 None
             }
         }
@@ -110,14 +110,6 @@ fn respond(request: tiny_http::Request, is_error: bool) {
     if let Err(e) = request.respond(response) {
         log::warn!("respond: failed to write callback response: {e}");
     }
-}
-
-/// Parse a callback URL pasted by the user (or delivered by the listener) into
-/// `(code, state)`, surfacing `?error=` as `OktaError`.
-pub fn parse_callback_url(url: &str) -> Result<(String, String), OktaAuthError> {
-    let query = url.split('?').nth(1).ok_or(OktaAuthError::NoQueryParams)?;
-    let (code, state, error, error_description) = parse_query_params(query);
-    to_code_and_state(code, state, error, error_description)
 }
 
 fn parse_query_params(query: &str) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
