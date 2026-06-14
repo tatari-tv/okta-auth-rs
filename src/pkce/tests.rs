@@ -348,6 +348,22 @@ fn headless_session_uses_device_grant() {
 }
 
 #[test]
+fn authorize_device_runs_device_grant_and_joins_scopes() {
+    let device = FakeDeviceRunner::new("FORCED-TOKEN");
+    let scopes = vec!["openid".to_string(), "email".to_string(), "offline_access".to_string()];
+
+    let token = authorize_device_inner("https://test.okta.com/oauth2/default", "client-123", &scopes, &device).unwrap();
+
+    assert_eq!(token.access_token, "FORCED-TOKEN");
+    assert_eq!(device.calls.get(), 1, "forced path must run the device grant");
+    assert_eq!(
+        device.last_scope.borrow().as_deref(),
+        Some("openid email offline_access"),
+        "scopes must be space-joined for the device grant"
+    );
+}
+
+#[test]
 fn local_session_opens_browser_and_completes_via_listener() {
     let binder = FakeBinder::with(FakeListener::new(vec![Ok(Some(code_capture()))]));
     let opener = FakeOpener::new();
