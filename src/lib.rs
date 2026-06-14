@@ -28,9 +28,11 @@ pub struct OktaAuthConfig {
     pub redirect_uri: String,
     /// OAuth2 scopes to request
     pub scopes: Vec<String>,
-    /// Application name, used for the token cache directory (~/.config/<app_name>/tokens.json)
+    /// Application name (informational, e.g. for logging). The token cache is shared
+    /// across all okta-auth consumers at `~/.cache/okta/` and is NOT keyed by this
+    /// name, so tools using the same Okta client share one cached credential.
     pub app_name: String,
-    /// Override the token cache directory. If None, uses ~/.config/<app_name>/
+    /// Override the token cache directory. If None, uses the shared `~/.cache/okta/`.
     pub cache_dir: Option<PathBuf>,
 }
 
@@ -52,10 +54,7 @@ impl OktaAuth {
     }
 
     fn cache_dir(&self) -> PathBuf {
-        self.config
-            .cache_dir
-            .clone()
-            .unwrap_or_else(|| cache::default_cache_dir(&self.config.app_name))
+        self.config.cache_dir.clone().unwrap_or_else(cache::default_cache_dir)
     }
 
     /// Returns a valid access token. Refreshes or re-authenticates as needed.
@@ -211,8 +210,9 @@ mod tests {
             app_name: "my-cool-app".to_string(),
             cache_dir: None,
         });
+        // The default cache dir is the shared `~/.cache/okta`, NOT keyed by app_name.
         let dir = auth.cache_dir();
-        assert!(dir.ends_with("my-cool-app"));
+        assert!(dir.ends_with("okta"));
     }
 
     #[test]

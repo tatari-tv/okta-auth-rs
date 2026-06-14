@@ -26,26 +26,32 @@ impl TokenCache {
     }
 }
 
-/// XDG config dir, honoring `$XDG_CONFIG_HOME` and falling back to `$HOME/.config`.
+/// XDG cache dir, honoring `$XDG_CACHE_HOME` and falling back to `$HOME/.cache`.
 ///
-/// We deliberately do NOT use the `dirs` config/data helpers: those honor
-/// `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` only on Linux. On macOS they resolve via system
-/// APIs and return `~/Library/...`, ignoring the env vars. These helpers resolve to the
-/// same XDG layout on every platform.
-fn xdg_config_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+/// A token cache is regenerable, non-essential data (lose it -> re-login), so it
+/// belongs under `XDG_CACHE_HOME`, not `XDG_CONFIG_HOME` (which is for static,
+/// hand-edited configuration). Resolved without the `dirs` cache helper so it honors
+/// the env var on every platform (macOS included, where `dirs` would return
+/// `~/Library/Caches` and ignore the env var).
+fn xdg_cache_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
         let path = PathBuf::from(dir);
         if path.is_absolute() {
             return Some(path);
         }
     }
-    dirs::home_dir().map(|h| h.join(".config"))
+    dirs::home_dir().map(|h| h.join(".cache"))
 }
 
-pub fn default_cache_dir(app_name: &str) -> PathBuf {
-    xdg_config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join(app_name)
+/// The default token cache directory: `~/.cache/okta/`.
+///
+/// This is **shared** across every CLI that uses okta-auth (it is not keyed by
+/// app name), so a login with a given Okta app is reused by all of them - one login,
+/// many tools. Tools that authenticate with the same Okta client therefore share a
+/// single cached credential. A tool that needs isolation can still pass an explicit
+/// `cache_dir`.
+pub fn default_cache_dir() -> PathBuf {
+    xdg_cache_dir().unwrap_or_else(|| PathBuf::from(".cache")).join("okta")
 }
 
 fn cache_path(dir: &Path) -> PathBuf {
@@ -335,12 +341,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn default_cache_dir_uses_app_name() {
-        let dir = default_cache_dir("my-test-app");
-        assert!(dir.ends_with("my-test-app"));
-    }
-
     // -- XDG resolution tests --
     //
     // Env-var mutation is process-global and unsafe under Edition 2024; `#[serial]`
@@ -362,42 +362,44 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn xdg_config_dir_honors_absolute_xdg_config_home() {
+    fn xdg_cache_dir_honors_absolute_xdg_cache_home() {
         let tmp = tempfile::tempdir().unwrap();
-        with_env("XDG_CONFIG_HOME", Some(tmp.path()), || {
-            assert_eq!(xdg_config_dir().as_deref(), Some(tmp.path()));
+        with_env("XDG_CACHE_HOME", Some(tmp.path()), || {
+            assert_eq!(xdg_cache_dir().as_deref(), Some(tmp.path()));
         });
     }
 
     #[test]
     #[serial_test::serial]
-    fn xdg_config_dir_falls_back_to_home_dot_config() {
+    fn xdg_cache_dir_falls_back_to_home_dot_cache() {
         let home = tempfile::tempdir().unwrap();
-        with_env("XDG_CONFIG_HOME", None, || {
+        with_env("XDG_CACHE_HOME", None, || {
             with_env("HOME", Some(home.path()), || {
-                assert_eq!(xdg_config_dir(), Some(home.path().join(".config")));
+                assert_eq!(xdg_cache_dir(), Some(home.path().join(".cache")));
             });
         });
     }
 
     #[test]
     #[serial_test::serial]
-    fn xdg_config_dir_ignores_relative_xdg_config_home() {
-        // A non-absolute $XDG_CONFIG_HOME is ignored in favor of the $HOME fallback.
+    fn xdg_cache_dir_ignores_relative_xdg_cache_home() {
+        // A non-absolute $XDG_CACHE_HOME is ignored in favor of the $HOME fallback.
         let home = tempfile::tempdir().unwrap();
-        with_env("XDG_CONFIG_HOME", Some(Path::new("relative/not-absolute")), || {
+        with_env("XDG_CACHE_HOME", Some(Path::new("relative/not-absolute")), || {
             with_env("HOME", Some(home.path()), || {
-                assert_eq!(xdg_config_dir(), Some(home.path().join(".config")));
+                assert_eq!(xdg_cache_dir(), Some(home.path().join(".cache")));
             });
         });
     }
 
     #[test]
     #[serial_test::serial]
-    fn default_cache_dir_joins_app_name_under_xdg() {
+    fn default_cache_dir_is_shared_okta_under_xdg_cache() {
+        // The cache dir is shared (`<XDG_CACHE>/okta`), not keyed by app name, so
+        // every tool using the same Okta client shares one credential.
         let tmp = tempfile::tempdir().unwrap();
-        with_env("XDG_CONFIG_HOME", Some(tmp.path()), || {
-            assert_eq!(default_cache_dir("my-app"), tmp.path().join("my-app"));
+        with_env("XDG_CACHE_HOME", Some(tmp.path()), || {
+            assert_eq!(default_cache_dir(), tmp.path().join("okta"));
         });
     }
 }
