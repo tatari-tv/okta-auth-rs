@@ -211,9 +211,11 @@ mod tests {
             app_name: "my-cool-app".to_string(),
             cache_dir: None,
         });
-        // The default cache dir is the shared `~/.cache/okta`, NOT keyed by app_name.
+        // The default cache dir is the shared `~/.cache/okta`, NOT keyed by app_name:
+        // it must equal the bare default and contain no trace of the app name.
         let dir = auth.cache_dir();
-        assert!(dir.ends_with("okta"));
+        assert_eq!(dir, cache::default_cache_dir());
+        assert!(!dir.to_string_lossy().contains("my-cool-app"));
     }
 
     #[test]
