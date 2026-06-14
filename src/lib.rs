@@ -92,8 +92,14 @@ impl OktaAuth {
         Ok(token_cache.access_token)
     }
 
-    /// Force interactive login via browser PKCE flow.
+    /// Force interactive login, auto-detecting the flow: a local GUI session uses
+    /// the browser redirect, anything headless uses the device grant. Fails fast in
+    /// a non-interactive session (no controlling terminal) - use [`login_device`] to
+    /// force the device grant there.
+    ///
+    /// [`login_device`]: OktaAuth::login_device
     pub fn login(&self) -> Result<(), OktaAuthError> {
+        debug!("login: auto-detecting flow (browser vs device grant)");
         let dir = self.cache_dir();
         let token_cache = pkce::authorize(
             &self.config.okta_issuer,
@@ -101,6 +107,21 @@ impl OktaAuth {
             &self.config.redirect_uri,
             &self.config.scopes,
         )?;
+        cache::save(&dir, &token_cache)?;
+        Ok(())
+    }
+
+    /// Force login via the OAuth2 device authorization grant (RFC 8628), bypassing
+    /// session classification. Unlike [`login`], this works with no controlling
+    /// terminal (agent shells, CI): it prints a code + verification URL and polls,
+    /// delivering nothing back to this host. The user approves on any device.
+    ///
+    /// [`login`]: OktaAuth::login
+    pub fn login_device(&self) -> Result<(), OktaAuthError> {
+        debug!("login_device: forcing device authorization grant");
+        let dir = self.cache_dir();
+        let token_cache =
+            pkce::authorize_device(&self.config.okta_issuer, &self.config.client_id, &self.config.scopes)?;
         cache::save(&dir, &token_cache)?;
         Ok(())
     }
