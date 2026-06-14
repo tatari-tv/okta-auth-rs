@@ -148,6 +148,38 @@ pub fn authorize(
     )
 }
 
+/// Force the OAuth2 device authorization grant (RFC 8628), bypassing session
+/// classification entirely.
+///
+/// `authorize()` only reaches the device grant when [`classify`] returns
+/// `Headless` - which requires a controlling terminal. An agent/non-interactive
+/// shell has no `/dev/tty`, so it classifies as `NonInteractive` and fails fast,
+/// even though the device grant would work fine there (it delivers nothing back to
+/// this host - it prints a code + URL and polls). This entry point is for callers
+/// that know they want the device grant regardless of the local environment.
+pub fn authorize_device(issuer: &str, client_id: &str, scopes: &[String]) -> Result<TokenCache, OktaAuthError> {
+    authorize_device_inner(issuer, client_id, scopes, &device::HttpDeviceRunner)
+}
+
+/// The device-runner-injected core of [`authorize_device`], so the forced path can be
+/// tested with a fake runner without hitting Okta.
+fn authorize_device_inner<D>(
+    issuer: &str,
+    client_id: &str,
+    scopes: &[String],
+    device: &D,
+) -> Result<TokenCache, OktaAuthError>
+where
+    D: DeviceRunner,
+{
+    debug!(
+        "authorize_device: issuer={issuer} client_id={client_id} scope_count={}",
+        scopes.len()
+    );
+    let scope = scopes.join(" ");
+    device.run(issuer, client_id, &scope)
+}
+
 /// The world-injected core of `authorize()`. Classifies the session and dispatches:
 /// `NonInteractive` fails fast; `Headless` runs the device grant; `Local` binds the
 /// listener, opens the browser, captures the callback, verifies CSRF, and exchanges.
