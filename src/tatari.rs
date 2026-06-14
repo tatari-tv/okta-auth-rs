@@ -10,9 +10,20 @@
 /// Tatari Okta authorization server issuer.
 pub const ISSUER: &str = "https://tatari.okta.com/oauth2/default";
 
-/// The unified Tatari CLI Okta app: a public native client (PKCE, no secret), so the
-/// id is safe to commit. One app shared by persona / marquee / verify, so one login
-/// is reused across all of them (paired with the shared `~/.cache/okta` token cache).
+/// The unified Tatari CLI Okta app: a public native client (PKCE, no secret), so this
+/// id is safe to commit even in a private repo. Per Okta's own docs, for public
+/// clients the Authorization Code + PKCE flow is done with "only the publicly-known
+/// information about the client: the `client_id` and `redirect_uri`" - the client_id
+/// is a public identifier, not a credential (only the client *secret* is "known only
+/// to Okta and your app", and these CLIs use no secret):
+/// <https://developer.okta.com/blog/2022/06/01/oauth-public-client-identity>
+///
+/// Native/public clients use client authentication "None" + PKCE (no client secret):
+/// <https://developer.okta.com/docs/guides/implement-grant-type/authcodepkce/main/>
+///
+/// The actually-sensitive values (a client secret, Okta API tokens) are not used by
+/// these CLIs at all. One app is shared by persona / marquee / verify, so one login is
+/// reused across all of them (paired with the shared `~/.cache/okta` token cache).
 pub const CLIENT_ID: &str = "0oa144xsutkeO1nev698";
 
 /// Shared local OAuth redirect URI, registered on the unified app. Multiple Okta apps
