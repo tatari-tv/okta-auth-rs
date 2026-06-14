@@ -5,6 +5,7 @@
 mod cache;
 mod error;
 mod pkce;
+pub mod tatari;
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
