@@ -21,7 +21,8 @@ pub enum OktaAuthError {
 
     #[error(
         "Okta token is missing or expired and no controlling terminal is available \
-         (non-interactive session). Re-authenticate in a terminal first, then retry."
+         (non-interactive session). Force the device authorization grant to log in - it \
+         needs no terminal (prints a code + URL, you approve on any device) - then retry."
     )]
     NonInteractive,
 
@@ -77,7 +78,8 @@ mod tests {
             (
                 OktaAuthError::NonInteractive,
                 "Okta token is missing or expired and no controlling terminal is available \
-                 (non-interactive session). Re-authenticate in a terminal first, then retry.",
+                 (non-interactive session). Force the device authorization grant to log in - it \
+                 needs no terminal (prints a code + URL, you approve on any device) - then retry.",
             ),
             (OktaAuthError::NoQueryParams, "No query parameters in callback"),
             (OktaAuthError::NoAuthCode, "No authorization code in callback"),
