@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::debug;
@@ -26,30 +27,48 @@ impl TokenCache {
     }
 }
 
-/// XDG config dir, honoring `$XDG_CONFIG_HOME` and falling back to `$HOME/.config`.
+/// XDG cache dir, honoring `$XDG_CACHE_HOME` and falling back to `$HOME/.cache`.
 ///
-/// We deliberately do NOT use the `dirs` config/data helpers: those honor
-/// `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` only on Linux. On macOS they resolve via system
-/// APIs and return `~/Library/...`, ignoring the env vars. These helpers resolve to the
-/// same XDG layout on every platform.
-fn xdg_config_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+/// A token cache is regenerable, non-essential data (lose it -> re-login), so it
+/// belongs under `XDG_CACHE_HOME`, not `XDG_CONFIG_HOME` (which is for static,
+/// hand-edited configuration). Resolved without the `dirs` cache helper so it honors
+/// the env var on every platform (macOS included, where `dirs` would return
+/// `~/Library/Caches` and ignore the env var).
+fn xdg_cache_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
         let path = PathBuf::from(dir);
         if path.is_absolute() {
             return Some(path);
         }
     }
-    dirs::home_dir().map(|h| h.join(".config"))
+    dirs::home_dir().map(|h| h.join(".cache"))
 }
 
-pub fn default_cache_dir(app_name: &str) -> PathBuf {
-    xdg_config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join(app_name)
+/// The default token cache directory: `~/.cache/okta/`.
+///
+/// This is **shared** across every CLI that uses okta-auth (it is not keyed by
+/// app name), so a login with a given Okta app is reused by all of them - one login,
+/// many tools. Tools that authenticate with the same Okta client therefore share a
+/// single cached credential. A tool that needs isolation can still pass an explicit
+/// `cache_dir`.
+pub fn default_cache_dir() -> PathBuf {
+    xdg_cache_dir().unwrap_or_else(|| PathBuf::from(".cache")).join("okta")
 }
 
 fn cache_path(dir: &Path) -> PathBuf {
     dir.join("tokens.json")
+}
+
+/// A per-writer staging path within `dir`. Because the cache dir is now shared across
+/// processes (`~/.cache/okta`), a fixed `tokens.json.tmp` would be a cross-process
+/// collision point: two tools writing at once would truncate each other's temp file
+/// and race the rename. The pid (cross-process) + a process-local monotonic counter
+/// (cross-thread) make every writer's staging file unique.
+fn staging_path(dir: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("tokens.json.{pid}.{seq}.tmp"))
 }
 
 pub fn load(dir: &Path) -> Result<Option<TokenCache>, OktaAuthError> {
@@ -67,25 +86,47 @@ pub fn save(dir: &Path, cache: &TokenCache) -> Result<(), OktaAuthError> {
     fs::create_dir_all(dir).map_err(|e| OktaAuthError::ConfigDir(e.to_string()))?;
 
     let path = cache_path(dir);
-    let temp_path = path.with_extension("json.tmp");
+    let temp_path = staging_path(dir);
 
-    let contents = serde_json::to_string_pretty(cache).map_err(|e| OktaAuthError::CacheWrite(e.to_string()))?;
-    {
-        let mut file = fs::File::create(&temp_path).map_err(|e| OktaAuthError::CacheWrite(e.to_string()))?;
-        file.write_all(contents.as_bytes())
-            .map_err(|e| OktaAuthError::CacheWrite(e.to_string()))?;
-        file.sync_all().map_err(|e| OktaAuthError::CacheWrite(e.to_string()))?;
+    // Stage to a per-writer temp file; clean it up on any failure so a failed writer
+    // never litters the shared dir with orphan temps.
+    if let Err(e) = write_staging(&temp_path, cache) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(e);
     }
 
+    // Atomic publish: POSIX rename(2) is atomic, so a concurrent reader always sees
+    // either the old or the new complete file, never a torn write. Concurrent writers
+    // => last writer wins, which is correct here: every token minted for the same
+    // client is equivalent.
+    if let Err(e) = fs::rename(&temp_path, &path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(OktaAuthError::CacheWrite(e.to_string()));
+    }
+    debug!("saved token cache to {:?}", path);
+    Ok(())
+}
+
+/// Write the cache to a freshly-created staging file. On unix the file is created with
+/// `0600` from the start (via `create_new` + `mode`), so there is no window where the
+/// token sits world-readable, and `create_new` guarantees we never adopt a stale temp.
+fn write_staging(temp_path: &Path, cache: &TokenCache) -> Result<(), OktaAuthError> {
+    let contents = serde_json::to_string_pretty(cache).map_err(|e| OktaAuthError::CacheWrite(e.to_string()))?;
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600))
-            .map_err(|e| OktaAuthError::CacheWrite(e.to_string()))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
 
-    fs::rename(&temp_path, &path).map_err(|e| OktaAuthError::CacheWrite(e.to_string()))?;
-    debug!("saved token cache to {:?}", path);
+    let mut file = opts
+        .open(temp_path)
+        .map_err(|e| OktaAuthError::CacheWrite(e.to_string()))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|e| OktaAuthError::CacheWrite(e.to_string()))?;
+    file.sync_all().map_err(|e| OktaAuthError::CacheWrite(e.to_string()))?;
     Ok(())
 }
 
@@ -280,8 +321,55 @@ mod tests {
 
         save(&dir, &cache).unwrap();
 
-        let temp_path = dir.join("tokens.json.tmp");
-        assert!(!temp_path.exists());
+        // No staging file (`tokens.json.<pid>.<seq>.tmp`) should survive a successful save.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "found orphan temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn concurrent_saves_to_shared_dir_yield_valid_cache() {
+        // Models the shared `~/.cache/okta` dir: many writers, one directory. Per-writer
+        // staging files must not collide, and the final tokens.json must be a complete,
+        // loadable file with no temp litter.
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Arc::new(tmp.path().join("okta"));
+        fs::create_dir_all(dir.as_path()).unwrap();
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let dir = Arc::clone(&dir);
+                thread::spawn(move || {
+                    let cache = TokenCache {
+                        access_token: format!("token-{i}"),
+                        refresh_token: Some(format!("refresh-{i}")),
+                        expires_at: now_secs() + 3600,
+                    };
+                    for _ in 0..10 {
+                        save(&dir, &cache).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // A complete, loadable token survives (last writer wins), and nothing leaked.
+        let loaded = load(&dir).unwrap().unwrap();
+        assert!(loaded.access_token.starts_with("token-"));
+        let temps: Vec<_> = fs::read_dir(dir.as_path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "orphan temp files after concurrent saves: {temps:?}");
     }
 
     #[test]
@@ -335,12 +423,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn default_cache_dir_uses_app_name() {
-        let dir = default_cache_dir("my-test-app");
-        assert!(dir.ends_with("my-test-app"));
-    }
-
     // -- XDG resolution tests --
     //
     // Env-var mutation is process-global and unsafe under Edition 2024; `#[serial]`
@@ -362,42 +444,44 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn xdg_config_dir_honors_absolute_xdg_config_home() {
+    fn xdg_cache_dir_honors_absolute_xdg_cache_home() {
         let tmp = tempfile::tempdir().unwrap();
-        with_env("XDG_CONFIG_HOME", Some(tmp.path()), || {
-            assert_eq!(xdg_config_dir().as_deref(), Some(tmp.path()));
+        with_env("XDG_CACHE_HOME", Some(tmp.path()), || {
+            assert_eq!(xdg_cache_dir().as_deref(), Some(tmp.path()));
         });
     }
 
     #[test]
     #[serial_test::serial]
-    fn xdg_config_dir_falls_back_to_home_dot_config() {
+    fn xdg_cache_dir_falls_back_to_home_dot_cache() {
         let home = tempfile::tempdir().unwrap();
-        with_env("XDG_CONFIG_HOME", None, || {
+        with_env("XDG_CACHE_HOME", None, || {
             with_env("HOME", Some(home.path()), || {
-                assert_eq!(xdg_config_dir(), Some(home.path().join(".config")));
+                assert_eq!(xdg_cache_dir(), Some(home.path().join(".cache")));
             });
         });
     }
 
     #[test]
     #[serial_test::serial]
-    fn xdg_config_dir_ignores_relative_xdg_config_home() {
-        // A non-absolute $XDG_CONFIG_HOME is ignored in favor of the $HOME fallback.
+    fn xdg_cache_dir_ignores_relative_xdg_cache_home() {
+        // A non-absolute $XDG_CACHE_HOME is ignored in favor of the $HOME fallback.
         let home = tempfile::tempdir().unwrap();
-        with_env("XDG_CONFIG_HOME", Some(Path::new("relative/not-absolute")), || {
+        with_env("XDG_CACHE_HOME", Some(Path::new("relative/not-absolute")), || {
             with_env("HOME", Some(home.path()), || {
-                assert_eq!(xdg_config_dir(), Some(home.path().join(".config")));
+                assert_eq!(xdg_cache_dir(), Some(home.path().join(".cache")));
             });
         });
     }
 
     #[test]
     #[serial_test::serial]
-    fn default_cache_dir_joins_app_name_under_xdg() {
+    fn default_cache_dir_is_shared_okta_under_xdg_cache() {
+        // The cache dir is shared (`<XDG_CACHE>/okta`), not keyed by app name, so
+        // every tool using the same Okta client shares one credential.
         let tmp = tempfile::tempdir().unwrap();
-        with_env("XDG_CONFIG_HOME", Some(tmp.path()), || {
-            assert_eq!(default_cache_dir("my-app"), tmp.path().join("my-app"));
+        with_env("XDG_CACHE_HOME", Some(tmp.path()), || {
+            assert_eq!(default_cache_dir(), tmp.path().join("okta"));
         });
     }
 }
