@@ -55,7 +55,7 @@ pub fn default_cache_dir() -> PathBuf {
     xdg_cache_dir().unwrap_or_else(|| PathBuf::from(".cache")).join("okta")
 }
 
-fn cache_path(dir: &Path) -> PathBuf {
+pub(crate) fn cache_path(dir: &Path) -> PathBuf {
     dir.join("tokens.json")
 }
 

@@ -14,7 +14,7 @@ let auth = OktaAuth::new(OktaAuthConfig {
     redirect_uri: "http://local.myorg.tools:11313/callback".to_string(),
     scopes: vec!["openid".to_string(), "email".to_string()],
     app_name: "my-cli".to_string(),
-    cache_dir: None, // defaults to ~/.config/<app_name>/
+    cache_dir: None, // defaults to the shared ~/.cache/okta/
 });
 
 // Returns a valid access token, refreshing or re-authenticating as needed.
@@ -24,6 +24,23 @@ let token = auth.get_token()?;
 `get_token()` checks the token cache first, then tries a transparent refresh, and
 only starts an interactive browser login as a last resort. `login()` forces an
 interactive login; `logout()` clears the cache.
+
+## Token cache location
+
+By default the token cache is the **shared** `~/.cache/okta/tokens.json` (honoring
+`$XDG_CACHE_HOME`), at mode `0600`. It is keyed by neither app name nor client, so
+every CLI built on this crate that authenticates with the same Okta client shares one
+cached credential - **one login, many tools**. A consumer that needs an isolated cache
+can set `cache_dir`. Use `auth.cache_dir()` / `auth.cache_path()` to report the real
+location in your own `--help`/status output instead of hardcoding a path.
+
+## Idempotent login (`login_or_reuse`)
+
+`login_or_reuse(force, device)` is a no-op when a valid token is already cached
+(reporting how long ago you logged in); pass `force = true` (wire it to a `--force`
+flag) to run the flow anew. It returns a `LoginOutcome` whose `message()` is a
+ready-to-print status line carrying the real cache path - so the "already logged in"
+and truthful-path behavior lives here once, not re-implemented per CLI.
 
 ## Authentication over SSH / headless hosts
 

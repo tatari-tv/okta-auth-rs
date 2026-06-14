@@ -37,6 +37,55 @@ pub struct OktaAuthConfig {
     pub cache_dir: Option<PathBuf>,
 }
 
+/// Outcome of [`OktaAuth::login_or_reuse`]. Carries the real cache path so the
+/// consumer's status line is always accurate (no hardcoded, drift-prone paths).
+#[derive(Debug)]
+pub enum LoginOutcome {
+    /// A valid token was already cached; no flow ran. `since` is when it was cached
+    /// (the cache file's mtime), if readable.
+    AlreadyLoggedIn {
+        cache_path: PathBuf,
+        since: Option<SystemTime>,
+    },
+    /// A login flow ran and cached a fresh token.
+    LoggedIn { cache_path: PathBuf },
+}
+
+impl LoginOutcome {
+    /// A ready-to-print one-line status, with the real cache path. Stream choice
+    /// (stdout vs stderr) is left to the consumer.
+    pub fn message(&self) -> String {
+        match self {
+            Self::AlreadyLoggedIn { cache_path, since } => {
+                let ago = since.map(format_ago).unwrap_or_default();
+                format!(
+                    "Already logged in{} (token cached at {}). Use --force to re-authenticate.",
+                    ago,
+                    cache_path.display()
+                )
+            }
+            Self::LoggedIn { cache_path } => {
+                format!("Logged in. Token cached at {}.", cache_path.display())
+            }
+        }
+    }
+}
+
+/// Human "~Nh ago" / "~Nm ago" for a past instant; empty-ish on clock skew.
+fn format_ago(since: SystemTime) -> String {
+    match SystemTime::now().duration_since(since) {
+        Ok(d) => {
+            let secs = d.as_secs();
+            if secs < 3600 {
+                format!(" since ~{}m ago", secs / 60)
+            } else {
+                format!(" since ~{}h ago", secs / 3600)
+            }
+        }
+        Err(_) => String::new(),
+    }
+}
+
 /// Okta OAuth2 PKCE authenticator for CLI tools.
 ///
 /// Handles the full token lifecycle: cache lookup, transparent refresh, and browser-based login.
@@ -54,8 +103,44 @@ impl OktaAuth {
         &self.config
     }
 
-    fn cache_dir(&self) -> PathBuf {
+    /// The token cache directory actually in use: the shared `~/.cache/okta` by
+    /// default, or an explicit `cache_dir` override. Public so consumers can report
+    /// the real path in `--help`/status output instead of hardcoding (and lying).
+    pub fn cache_dir(&self) -> PathBuf {
         self.config.cache_dir.clone().unwrap_or_else(cache::default_cache_dir)
+    }
+
+    /// The full path to the token cache file (`<cache_dir>/tokens.json`).
+    pub fn cache_path(&self) -> PathBuf {
+        cache::cache_path(&self.cache_dir())
+    }
+
+    /// Return the cached token if one exists AND is still valid, WITHOUT triggering a
+    /// refresh or interactive login. Lets a CLI make `login` idempotent ("already
+    /// logged in") and report status without forcing the flow.
+    pub fn cached_valid_token(&self) -> Result<Option<TokenCache>, OktaAuthError> {
+        Ok(cache::load(&self.cache_dir())?.filter(|c| c.is_valid()))
+    }
+
+    /// Idempotent login. When `force` is false and a valid token is already cached,
+    /// this is a no-op that reports how long ago you logged in. Otherwise it runs the
+    /// flow (device grant when `device`, else auto-detect browser/device) and caches
+    /// the token. Consumers wire a `--force` flag to `force` and print
+    /// [`LoginOutcome::message`] - so the "already logged in" / truthful-path behavior
+    /// lives here once, not re-implemented per CLI.
+    pub fn login_or_reuse(&self, force: bool, device: bool) -> Result<LoginOutcome, OktaAuthError> {
+        debug!("login_or_reuse: force={force} device={device}");
+        let cache_path = self.cache_path();
+        if !force && self.cached_valid_token()?.is_some() {
+            let since = std::fs::metadata(&cache_path).and_then(|m| m.modified()).ok();
+            return Ok(LoginOutcome::AlreadyLoggedIn { cache_path, since });
+        }
+        if device {
+            self.login_device()?;
+        } else {
+            self.login()?;
+        }
+        Ok(LoginOutcome::LoggedIn { cache_path })
     }
 
     /// Returns a valid access token. Refreshes or re-authenticates as needed.
@@ -234,6 +319,87 @@ mod tests {
         let auth = OktaAuth::new(config);
         let token = auth.get_token().unwrap();
         assert_eq!(token, "cached-access-token");
+    }
+
+    #[test]
+    fn cached_valid_token_returns_token_when_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(&tmp);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "valid".to_string(),
+                refresh_token: None,
+                expires_at: now + 3600,
+            },
+        )
+        .unwrap();
+        let auth = OktaAuth::new(config);
+        assert_eq!(auth.cached_valid_token().unwrap().unwrap().access_token, "valid");
+    }
+
+    #[test]
+    fn cached_valid_token_is_none_when_expired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(&tmp);
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old".to_string(),
+                refresh_token: None,
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+        let auth = OktaAuth::new(config);
+        assert!(auth.cached_valid_token().unwrap().is_none());
+    }
+
+    #[test]
+    fn cached_valid_token_is_none_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth = OktaAuth::new(test_config(&tmp));
+        assert!(auth.cached_valid_token().unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_path_is_tokens_json_under_cache_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth = OktaAuth::new(test_config(&tmp));
+        assert_eq!(auth.cache_path(), tmp.path().join("tokens.json"));
+    }
+
+    #[test]
+    fn login_or_reuse_is_noop_when_valid_token_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "valid".to_string(),
+                refresh_token: None,
+                expires_at: now + 3600,
+            },
+        )
+        .unwrap();
+        let auth = OktaAuth::new(test_config(&tmp));
+        // force=false + valid cache => no flow runs (no network), reports already-in.
+        let outcome = auth.login_or_reuse(false, true).unwrap();
+        assert!(matches!(outcome, LoginOutcome::AlreadyLoggedIn { .. }));
+        let msg = outcome.message();
+        assert!(msg.contains("Already logged in"), "got: {msg}");
+        assert!(msg.contains("tokens.json"), "message must show the real path: {msg}");
+        assert!(msg.contains("--force"));
+    }
+
+    #[test]
+    fn login_outcome_logged_in_message_reports_real_path() {
+        let outcome = LoginOutcome::LoggedIn {
+            cache_path: std::path::PathBuf::from("/home/u/.cache/okta/tokens.json"),
+        };
+        let msg = outcome.message();
+        assert!(msg.contains("Logged in. Token cached at /home/u/.cache/okta/tokens.json."));
     }
 
     #[test]
