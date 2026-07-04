@@ -25,6 +25,50 @@ let token = auth.get_token()?;
 only starts an interactive browser login as a last resort. `login()` forces an
 interactive login; `logout()` clears the cache.
 
+## Consuming this crate in CI (private git dependency)
+
+`okta-auth-rs` is a **private** repo, pulled as a git dependency:
+
+```toml
+okta-auth = { git = "https://github.com/tatari-tv/okta-auth-rs", tag = "v0.5.0" }
+```
+
+A GitHub Actions runner's built-in `GITHUB_TOKEN` is scoped to the *workflow's own*
+repo, so it cannot clone this *second* private repo. Cargo then fails with:
+
+```
+failed to authenticate when downloading repository
+revision <sha> not found
+```
+
+The "revision not found" is a **symptom of the auth failure**, not a missing commit.
+Note that **`otto ci` / `cargo build` passing locally is NOT sufficient** - your
+machine has git credentials the runner does not.
+
+Every consuming workflow (both `ci` and `release`) needs the same two pieces:
+
+1. Tell cargo to fetch git deps via the `git` CLI, which honors global config:
+
+   ```yaml
+   env:
+     CARGO_NET_GIT_FETCH_WITH_CLI: true
+   ```
+
+2. Rewrite the GitHub URL with a token that can read this repo, in **every job**,
+   after `actions/checkout` and before the Rust/build steps:
+
+   ```yaml
+   - name: Configure git for private deps
+     run: git config --global url."https://x-access-token:${{ secrets.ACTIONS_CLONE_SUBMODULE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+   ```
+
+`ACTIONS_CLONE_SUBMODULE_TOKEN` is the org secret provisioned for exactly this
+cross-repo read. For tag-driven releases, the org reusable workflow
+`tatari-tv/github-actions/.github/workflows/rust-cli-release.yml` wires this up when
+you pass `private-deps: true` and `private-deps-token: ${{ secrets.ACTIONS_CLONE_SUBMODULE_TOKEN }}`.
+
+Reference consumers to copy from: `persona-cli`, `marquee`, `sdv`, `slack-cli`.
+
 ## Token cache location
 
 By default the token cache is the **shared** `~/.cache/okta/tokens.json` (honoring
