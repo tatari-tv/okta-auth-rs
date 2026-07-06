@@ -177,6 +177,59 @@ impl OktaAuth {
         Ok(token_cache.access_token)
     }
 
+    /// Return a valid access token WITHOUT any interactive flow: cached token when
+    /// valid, else a silent refresh via the cached refresh token, else
+    /// [`OktaAuthError::NonInteractive`]. It NEVER launches a browser or the device
+    /// grant. Intended for headless servers (e.g. `persona mcp`) that must fail fast
+    /// with a "run `<tool> login`" hint instead of blocking on a login prompt.
+    ///
+    /// Distinct from [`get_token`], which falls through to a browser login when no
+    /// usable cached/refreshable token exists.
+    ///
+    /// [`get_token`]: OktaAuth::get_token
+    pub fn get_token_noninteractive(&self) -> Result<String, OktaAuthError> {
+        let dir = self.cache_dir();
+        debug!("get_token_noninteractive: cache_dir={}", dir.display());
+        if let Some(cached) = cache::load(&dir)? {
+            if cached.is_valid() {
+                debug!(
+                    "get_token_noninteractive: using cached access token (expires_at={})",
+                    cached.expires_at
+                );
+                return Ok(cached.access_token);
+            }
+
+            if let Some(ref refresh_token) = cached.refresh_token {
+                debug!("get_token_noninteractive: access token expired, attempting silent refresh");
+                match self.refresh(refresh_token) {
+                    Ok(new_cache) => {
+                        cache::save(&dir, &new_cache)?;
+                        debug!(
+                            "get_token_noninteractive: refresh succeeded (expires_at={})",
+                            new_cache.expires_at
+                        );
+                        return Ok(new_cache.access_token);
+                    }
+                    Err(e) => {
+                        // Log the real cause (Okta down / timeout / refresh-token rotation)
+                        // before collapsing to NonInteractive, so headless drops stay
+                        // debuggable - then fail closed, never a browser.
+                        warn!(
+                            "get_token_noninteractive: refresh failed ({e}); no interactive fallback, returning NonInteractive"
+                        );
+                        return Err(OktaAuthError::NonInteractive);
+                    }
+                }
+            }
+
+            warn!("get_token_noninteractive: cached token expired with no refresh token; returning NonInteractive");
+            return Err(OktaAuthError::NonInteractive);
+        }
+
+        warn!("get_token_noninteractive: no cached token; returning NonInteractive");
+        Err(OktaAuthError::NonInteractive)
+    }
+
     /// Force interactive login, auto-detecting the flow: a local GUI session uses
     /// the browser redirect, anything headless uses the device grant. Fails fast in
     /// a non-interactive session (no controlling terminal) - use [`login_device`] to
@@ -256,6 +309,23 @@ impl OktaAuth {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Spawn a one-shot local HTTP server (reusing the in-house `tiny_http` dep) that
+    /// answers a single request with `body` and 200/JSON, then returns the base issuer
+    /// URL pointing at it. Used to exercise the silent-refresh path without live Okta:
+    /// `refresh()` POSTs to `{issuer}/v1/token`, which this server answers.
+    fn spawn_token_server(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok(req) = server.recv() {
+                let header = "Content-Type: application/json".parse::<tiny_http::Header>().unwrap();
+                let resp = tiny_http::Response::from_string(body).with_header(header);
+                let _ = req.respond(resp);
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
 
     fn test_config(tmp: &tempfile::TempDir) -> OktaAuthConfig {
         OktaAuthConfig {
@@ -455,6 +525,130 @@ mod tests {
         // masked as NonInteractive by the interactivity check (which runs after URL build).
         let result = auth.get_token();
         assert!(matches!(result, Err(OktaAuthError::InvalidUrl(_))));
+    }
+
+    #[test]
+    fn get_token_noninteractive_returns_cached_when_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "cached-valid".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: now + 3600,
+            },
+        )
+        .unwrap();
+        let auth = OktaAuth::new(test_config(&tmp));
+        // Valid cache: returned as-is, no refresh, no browser.
+        assert_eq!(auth.get_token_noninteractive().unwrap(), "cached-valid");
+    }
+
+    #[test]
+    fn get_token_noninteractive_refreshes_expired_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (issuer, handle) = spawn_token_server(
+            r#"{"access_token":"refreshed-access","token_type":"bearer","expires_in":3600,"refresh_token":"rotated-refresh"}"#,
+        );
+
+        // Expired access token WITH a refresh token -> silent refresh via the mock.
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: Some("stale-refresh".to_string()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: issuer,
+            client_id: "fake-client".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+
+        let token = auth.get_token_noninteractive().unwrap();
+        assert_eq!(token, "refreshed-access");
+
+        // The refreshed token (and rotated refresh token) is persisted to the cache.
+        let reloaded = cache::load(tmp.path()).unwrap().unwrap();
+        assert_eq!(reloaded.access_token, "refreshed-access");
+        assert_eq!(reloaded.refresh_token.as_deref(), Some("rotated-refresh"));
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_token_noninteractive_returns_noninteractive_when_expired_no_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Expired access token, NO refresh token: must fail closed with NonInteractive.
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: None,
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+        let auth = OktaAuth::new(test_config(&tmp));
+        let result = auth.get_token_noninteractive();
+        // Asserting the SPECIFIC variant is what makes this test bite: if the code
+        // fell through to a browser login (like get_token), the test_config's fake
+        // issuer would surface InvalidUrl/other, not NonInteractive - and this fails.
+        assert!(
+            matches!(result, Err(OktaAuthError::NonInteractive)),
+            "expected NonInteractive, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn get_token_noninteractive_returns_noninteractive_when_no_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No cached token at all: fail closed, never a browser.
+        let auth = OktaAuth::new(test_config(&tmp));
+        let result = auth.get_token_noninteractive();
+        assert!(
+            matches!(result, Err(OktaAuthError::NonInteractive)),
+            "expected NonInteractive, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn get_token_noninteractive_returns_noninteractive_when_refresh_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Expired + refresh token present, but the token endpoint is unreachable
+        // (connection refused on port 1). Refresh fails -> warn -> NonInteractive,
+        // NOT a browser fallthrough.
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: Some("stale-refresh".to_string()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+        let config = OktaAuthConfig {
+            okta_issuer: "http://127.0.0.1:1/oauth2/default".to_string(),
+            client_id: "fake-client".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+        let result = auth.get_token_noninteractive();
+        assert!(
+            matches!(result, Err(OktaAuthError::NonInteractive)),
+            "expected NonInteractive, got {result:?}"
+        );
     }
 
     #[test]
