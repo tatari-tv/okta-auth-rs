@@ -1,20 +1,17 @@
 name: ci
+
+# Public repo: calls the PUBLIC reusable. Previously this called the INTERNAL
+# tatari-tv/github-actions platform-standard-ci.yml@v5, which a public repo cannot
+# resolve (GitHub blocks public -> internal), producing a 0-job startup failure.
+# Swapped to the public twin tatari-tv/github-actions-public/rust-ci.yml@v1. CI =
+# `otto ci`; the caller owns the trigger. Toolchain (1.96.0) and whitespace (v0.1.6)
+# use the reusable's defaults. No id-token/statuses/secrets needed: the public
+# reusable runs on a bare runner (no ECR), only contents: read. Library -> CI only.
 on:
   push:
-    branches: ["**"]
-  workflow_dispatch: {}
-
-permissions:
-  contents: read
-  id-token: write
-  statuses: write
+    branches: ['**']
+  pull_request: {}
 
 jobs:
   ci:
-    uses: tatari-tv/github-actions/.github/workflows/platform-standard-ci.yml@v5
-    secrets: inherit
-    with:
-      # Pin the Rust toolchain so the "Rust Build" job runs in the ECR builder-base
-      # image. Left empty, that job uses the public rust:slim-bookworm image but still
-      # attaches ECR credentials, so its container login fails. Matches marquee.
-      rust-version: "1.96"
+    uses: tatari-tv/github-actions-public/.github/workflows/rust-ci.yml@v1
