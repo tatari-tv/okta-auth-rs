@@ -149,8 +149,9 @@ just works** - a valid cached token or a working refresh token never reaches the
 interactive path. Only a real re-login (which needs a human) fails fast. So the fix
 for a `NonInteractive` error is to re-authenticate once in a terminal; the cached
 token then serves subsequent non-interactive runs until the refresh token itself dies -
-**7 idle days**, an explicit revoke, or user deactivation - not the access token's 12h
-lifetime. A dead refresh token is dropped from the cache automatically on its next use
+idle expiry, an explicit revoke, or user deactivation - not the access token's 12h
+lifetime. The idle window is set by the Okta authorization server's policy, not by this
+crate; on the Tatari tenant it is currently **7 days**. A dead refresh token is dropped from the cache automatically on its next use
 (Okta's `invalid_grant`), so the next `login` goes straight to the flow instead of
 retrying a token that can never succeed.
 

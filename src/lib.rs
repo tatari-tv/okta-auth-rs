@@ -1851,6 +1851,7 @@ mod tests {
         mock.finish();
     }
 
+    #[cfg(unix)]
     #[test]
     fn login_or_reuse_propagates_cache_write_instead_of_opening_browser() {
         use std::os::unix::fs::PermissionsExt;
