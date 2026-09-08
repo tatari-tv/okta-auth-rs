@@ -531,22 +531,21 @@ CI after the fix:
   corrupt cache yields no token, therefore no revoke request.
 
 ### Deviations
-- **The two ports differ in strictness on purpose, and must not be "fixed" into
-  agreement.** Python catches `(CacheParseError, CacheReadError)` by name; Rust matches
-  `Err(e)` for every variant. Rust's is behaviorally identical *today*: `cache::load`
-  has exactly two error surfaces, `CacheRead` at `src/cache.rs:80` (the `read_to_string`
-  failure) and `CacheParse` at `src/cache.rs:81` (the `serde_json::from_str` failure),
-  and every other path through the function returns `Ok`. So no error the wide match can
-  absorb is one the narrow match would have propagated. It is still the weaker shape: it
-  silently widens the first time `load` grows a variant, and this is the credential path.
-  It was not re-opened because it had already shipped in `v0.7.0`, and re-cutting a tag
-  that four repos are about to pin is not worth a change with no behavioral difference.
-  The deliberate resolution: **Python stays narrow, Rust's wide match is a known
-  follow-up, and a future parity pass must converge Rust toward Python - never the
-  reverse.**
-- **The Python warnings name the cache file path; the Rust warnings do not.** Python
-  logs `cache.cache_path(directory)` in both messages; Rust logs the error only. Minor
-  parity gap in operator-facing output, not in behavior.
+- **Rust shipped a catch-all `Err(e) => None` in `v0.7.0` and was narrowed immediately
+  after; Python was narrow from the first commit.** Both ports now name the two errors
+  they absorb - `CacheRead`/`CacheParse` in Rust, `CacheParseError`/`CacheReadError` in
+  Python - so a parity check should read one story, not two. The window in between was
+  not a behavioral gap: `cache::load` has exactly two error surfaces, `CacheRead` at
+  `src/cache.rs:80` (the `read_to_string` failure) and `CacheParse` at `src/cache.rs:81`
+  (the `serde_json::from_str` failure), and every other path through the function
+  returns `Ok`, so no error the catch-all absorbed was one the named match would have
+  propagated. The narrowing is hygiene against a future variant on the credential path,
+  not a defect fix, which is why it was a separate PR against `main` rather than a
+  reason to re-cut a tag four consumer repos were pinning.
+- **`v0.7.0`'s Rust warnings logged the error but not the cache path; Python's named it
+  from the start.** Closed in `okta-auth-rs#21` alongside the narrowing: both ports now
+  log `cache_path`, so the operator reading the log is told which file to remove. It was
+  an operator-facing gap only, never behavioral.
 - **This entry is not a phase.** No version bump, no tag, no status flip - it documents
   a defect fix against already-committed Phase 1/Phase 2 work.
 
@@ -583,9 +582,8 @@ In every run the *other* test of the pair still passed, so each test binds its o
 rather than both tests riding on one fix.
 
 ### Open questions
-- **Known follow-up, already decided in principle: narrow the two Rust matches to
-  `CacheParse`/`CacheRead`** so both ports name the errors they absorb, and **add the
-  cache path to the two Rust warnings** as Python's already do. Neither changes behavior
-  (see the Deviations entry and `src/cache.rs:80-81`), so both wait for the next change
-  that touches `src/lib.rs` rather than forcing a release. The direction is fixed: Rust
-  converges toward Python.
+- **None outstanding on this fix.** The one item that was open - narrowing the two Rust
+  matches and naming the cache path in the two Rust warnings, both to match Python - is
+  done in `okta-auth-rs#21`, which carries no version bump by explicit decision: it has
+  no behavioral difference (see the Deviations entry and `src/cache.rs:80-81`) and rides
+  whatever tag comes next rather than churning the four consumer pins on `v0.7.0`.
