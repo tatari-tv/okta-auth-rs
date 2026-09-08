@@ -471,3 +471,211 @@ Beyond the twenty-three parity names, both trees now carry:
   finalization; not done here.
 - Release tags for both repos remain owed and unowned by this pass, as Phase 1 and
   Phase 2 already recorded.
+
+## Regression fix: corrupt cache blocked both recovery paths
+
+A regression this feature introduced in both ports, found by CodeRabbit on
+`tatari-tv/okta-auth-py#7` and confirmed against the Rust baseline: on `origin/main`
+before this work, `logout()` was `cache::clear(&dir)?` and nothing else, so it was
+self-healing against a corrupt token cache. The offline_access work inserted a
+`cache::load(&dir)?` ahead of the recovery action at two sites per port - `logout` and
+`fresh_grant`/`_fresh_grant`. Because `load` propagates `CacheParse`/`CacheRead`
+(`CacheParseError`/`CacheReadError`) on an unreadable or corrupt file, both escape
+hatches disappeared at once:
+
+- `logout` could no longer delete a corrupt cache: the command whose whole job is
+  deleting the bad file refused because it could not read the bad file.
+- `fresh_grant` reads the old token before running the flow and calling `cache::save`,
+  so `login`, `login_device`, and a forced `login_or_reuse` could no longer overwrite a
+  corrupt cache either.
+
+The user's only remaining fix was `rm` by hand, with nothing in the error pointing
+there.
+
+Fixed in `okta-auth-rs` on `feat/offline-access-refresh-tokens` as `e2592e3`, which
+landed on `main` in the `#19` squash (`d830c40`) and shipped in the annotated tag
+`v0.7.0` (dereferences to `d830c40`, `origin/main`'s tip). Fixed in `okta-auth-py` on
+`feat-auth-request-offline-access-refresh` as `39b5e41`, PR `#7`.
+
+CI after the fix:
+- `okta-auth-rs`: `otto ci` green at `d830c40` - `cargo test --all-features`
+  **106 passed, 0 failed** (104 before, +2 new tests), `[ci] OK: All CI checks passed!`.
+- `okta-auth-py`: `otto ci` green at `39b5e41` - `pytest` **111 passed** (109 before,
+  +2 new tests), `[ci] All CI checks passed!`.
+
+### Design decisions
+- **An unreadable cache reads as "no refresh token", not as an error** -
+  `src/lib.rs:logout`, `src/lib.rs:fresh_grant`, `src/okta_auth/auth.py:logout`,
+  `src/okta_auth/auth.py:_fresh_grant` - a cache we cannot parse holds no refresh token
+  we could revoke anyway, so best-effort-`None` is the honest reading of the file and it
+  is what restores the recovery path. Both call sites carry a comment saying exactly
+  that: this is the non-obvious case the comments rule says to comment.
+- **Only the two read errors are absorbed; every other error still propagates** - in
+  particular the `CacheWrite`/`CacheWriteError` precedence in `logout` (a failed `clear`
+  beats a failed revoke, because a revoked token still on disk is what `is_valid()`
+  would hand out) is untouched. Proven still to hold by the four pre-existing tests
+  that pin it, all still green in both ports: `logout_returns_cache_write_when_clear_fails`,
+  `refresh_invalid_grant_with_failed_clear_returns_cache_write`,
+  `get_token_propagates_cache_write_instead_of_opening_browser`,
+  `login_or_reuse_propagates_cache_write_instead_of_opening_browser`.
+- **Two parity-named tests per port, matching snake_case suffixes with Python's `test_` prefix** -
+  `logout_clears_cache_when_cache_file_is_unreadable` and
+  `fresh_grant_proceeds_when_cache_file_is_unreadable`. Each writes a genuinely invalid
+  JSON cache file (`{ not json` / `{ this is not json`) and asserts the recovery
+  *outcome*, not the absence of an exception: logout asserts `tokens.json` is gone
+  afterward; fresh_grant asserts the flow ran (`interactive_calls == 1`) and that the
+  new grant is the file on disk.
+- **No revoke may go out on either path** - both tests point the issuer at an
+  unreachable `127.0.0.1:1` (Rust) or assert on a `requests.post` that raises on any
+  call (Python), so "no attempted revoke" is an assertion rather than an assumption: a
+  corrupt cache yields no token, therefore no revoke request.
+
+### Deviations
+- **The two ports absorb the same errors by different means, and the difference is
+  unintended.** Python catches `CacheParseError`/`CacheReadError` by name; Rust
+  `v0.7.0`, and `main`, match `Err(e)` for every variant. Narrow was asked for in both;
+  Rust went wide because it was written that way while the fix was being made in-flight,
+  not because anyone chose the looser shape. It is not a defect today: `cache::load` has
+  exactly two error surfaces, `CacheRead` at `src/cache.rs:80` (the `read_to_string`
+  failure) and `CacheParse` at `src/cache.rs:81` (the `serde_json::from_str` failure),
+  and every other path through the function returns `Ok`, so no error the catch-all
+  absorbs is one the named match would have propagated. It is still the weaker shape -
+  it silently widens the first time `load` grows a variant, on the credential path - so
+  it resolves toward Python, narrow, in the next change that touches `src/lib.rs`. It is
+  deliberately not being fixed on its own: the diff changes nothing observable, and it
+  would spend an SRE CODEOWNER review on a no-op in the repo that owns the credential
+  path. **Direction is fixed: Rust converges toward Python, never the reverse.**
+- **The Rust warnings log the error but not the cache path; Python's name the path.**
+  Python logs `cache.cache_path(directory)` in both messages so the operator reading the
+  log is told which file to remove; Rust logs the error only. Operator-facing gap, never
+  behavioral, and it rides along with the narrowing above whenever `src/lib.rs` is next
+  touched.
+- **This entry is not a phase.** No version bump, no tag, no status flip - it documents
+  a defect fix against already-committed Phase 1/Phase 2 work.
+
+### Tradeoffs
+- **Absorb the read error at the two recovery call sites** vs **make `cache::load`
+  itself lenient**. Absorbing at the call site keeps `load` honest for its other
+  callers - `cached_valid_token` still propagates `CacheParse` rather than silently
+  reporting "logged out", which is the behavior the audit already pinned. Only the two
+  functions whose next action destroys or overwrites the file get to shrug at it.
+- **Inline `try`/`match` at each of the two sites** vs **one shared best-effort helper
+  per port**. The duplicated block is five lines and the two comments are genuinely
+  different (one is "the clear must still run", the other is "the flow and save must
+  still run"). A shared helper would have collapsed both into one name and cost the
+  site-specific reasoning.
+- **Warn rather than silently continue.** A corrupt cache is a real event the operator
+  should see in `--debug` output even though it is not fatal here; swallowing it
+  entirely would make "why did it re-prompt me?" unanswerable.
+
+### Break-to-prove runs
+
+Each fix was reverted to the exact pre-fix expression, the matching test run, the
+failure observed, and the file restored. Rust was mutated in a throwaway `git worktree`
+at `d830c40` so the shared checkout was never left dirty; Python was mutated in place
+from a saved pristine copy and restored byte-for-byte.
+
+| # | mutation | test | observed failure |
+|---|---|---|---|
+| 1 | rs: `logout` best-effort match -> `cache::load(&dir)?` | `logout_clears_cache_when_cache_file_is_unreadable` | `panicked at src/lib.rs:860:23: called Result::unwrap() on an Err value: CacheParse("key must be a string at line 1 column 3")` - `test result: FAILED. 1 passed; 1 failed` |
+| 2 | rs: `fresh_grant` best-effort match -> `cache::load(&dir)?` | `fresh_grant_proceeds_when_cache_file_is_unreadable` | `panicked at src/lib.rs:883:22: called Result::unwrap() on an Err value: CacheParse("key must be a string at line 1 column 3")` - `test result: FAILED. 1 passed; 1 failed` |
+| 3 | py: `logout` `try`/`except` -> `cached = cache.load(directory)` | `test_logout_clears_cache_when_cache_file_is_unreadable` | `okta_auth.error.CacheParseError: Failed to parse token cache: Expecting property name enclosed in double quotes: line 1 column 3 (char 2)` raised from `src/okta_auth/cache.py:181` - `1 failed, 1 passed` |
+| 4 | py: `_fresh_grant` `try`/`except` -> `old_cached = cache.load(directory)` | `test_fresh_grant_proceeds_when_cache_file_is_unreadable` | same `CacheParseError` from `src/okta_auth/cache.py:181` - `1 failed, 1 passed` |
+
+In every run the *other* test of the pair still passed, so each test binds its own site
+rather than both tests riding on one fix.
+
+### Open questions
+- **One known follow-up, deliberately deferred rather than open:** narrow the two Rust
+  matches to `CacheRead`/`CacheParse` and name the cache path in the two Rust warnings,
+  both to match Python. Neither changes behavior (see the Deviations entries and
+  `src/cache.rs:80-81`), so neither justifies its own PR against the repo that owns the
+  credential path, nor a re-cut of the `v0.7.0` tag that consumer repos are pinning.
+  It lands with the next change that touches `src/lib.rs`. Recorded here so that change
+  knows to carry it, and so a future parity pass resolves the difference toward Python
+  rather than away from it.
+
+
+## Phase 3: Rust consumers bump together
+
+### Design decisions
+
+- Pinned all four consumers to `tag = "v0.7.0"`, tag-only, with no `version` field — `slack-cli/Cargo.toml:30`, `marquee/cli/Cargo.toml:29`, `sdv/Cargo.toml:19`, `persona-cli/Cargo.toml:23` — one shape across the fleet, so the tag grep and cargo's resolver agree about what is pinned. On slack-cli the `version = "0.5.0"` field made the requirement parse as `^0.5.0`, which no v0.7.0 tag can satisfy, while a tag-only grep still reported success.
+- Cleared the Slack token cache before propagating the Okta result — `slack-cli/src/auth.rs:logout` — `OktaAuth::logout` deletes the Okta cache and *then* returns `RevokeFailed`, so the previous early `?` produced the one state worse than either failure alone: a stale Slack token on disk with no Okta token left to re-vend one.
+- Produced the revoke failure in the test from a real closed port (`http://127.0.0.1:1`) rather than a mock — `slack-cli/src/auth/tests.rs:logout_clears_slack_cache_even_when_okta_revoke_fails` — `logout` takes a concrete `&OktaAuth` with no injection seam, and an unroutable issuer exercises the true `revoke()` error path with no network and no HTTP fixture.
+- Moved the test-only `ENV_LOCK` and `set_env` into a shared `crate::test_env` — `slack-cli/src/lib.rs` — see Deviations.
+- Named every branch `pin-okta-auth-v0-7-0-for-offline-access-refresh-tokens`, the slug of the shared commit subject, so the `branch-pr-title-guard` hook accepts the commit subject verbatim as the PR title.
+
+### Deviations
+
+- Spec said to keep the phrase "Unattended runs reuse the existing silent-refresh Okta path" in `slack-cli/README.md` while adding the refresh-token-death case, but the acceptance criterion greps for `silent-refresh Okta path` and requires 0 lines. Both cannot hold. Kept the claim, reworded the sentence to "reuse the same Okta token refresh an interactive run uses", satisfying the intent and the criterion.
+- Spec scoped the sdv doc fix to the prose at `sdv.yml:33-34` and `CLAUDE.md:78-79`. Also updated the `scopes:` example directly below that prose and the scope list at `CLAUDE.md:74`, both of which still read `openid email profile`. v0.7.0 fail-closes at `lib.rs:416` when the shared default cache is used without `offline_access`, so the example as written was a live trap for anyone who uncommented it.
+- Spec scoped slack-cli to one code change plus one test. Also moved `ENV_LOCK`/`set_env` from per-module statics in `config/tests.rs` and `valet/tests.rs` into a shared `crate::test_env`. Unit tests run as threads in a single binary, so three independent mutexes guarding the same `XDG_CACHE_HOME` serialize nothing; without this the new test could have its cache path moved mid-run by another module and flake. Same effect, correct seam.
+- Branches were created as `deps/okta-auth-v0.7.0` and renamed to `pin-okta-auth-v0-7-0-for-offline-access-refresh-tokens`. The `branch-pr-title-guard` hook slugifies a PR title by collapsing every non-alphanumeric run to `-` and demands exact equality with the branch, so a branch containing `/` can never be matched by any title.
+- persona-cli's `Cargo.lock` is gitignored (`.gitignore:8`), so its commit contains only `Cargo.toml`. The lock was still regenerated and CI compiled against v0.7.0. The other three track and committed their lockfiles.
+- marquee was built and committed in a detached `git worktree` at `main` rather than in the primary checkout, which held another agent's large in-flight change. Its `main` advanced from `8002b4e` to `0be08e2` mid-build; the branch was rebased onto `0be08e2` and CI re-run green on the rebased commit.
+
+### Tradeoffs
+
+- Closed local port vs. a `mockito` server for the revoke failure — mockito is already a dev-dependency, but a connection-refused error needs no server lifecycle, no port binding, and no risk of a hung test; the assertion is on `logout`'s ordering, not on Okta's wire format.
+- Reworded the README sentence vs. relaxing the acceptance criterion — the criterion is what the phase is graded on, and the phrase was the stale wording it was written to catch; the claim survives, only the targeted words are gone.
+- Shared `test_env` module vs. leaving three per-module locks and accepting a rare flake — a test that passes for timing reasons is the failure mode this phase's audit was already cleaning up, so the small refactor was preferred over adding to it.
+- Branch named from the commit subject vs. the shorter `deps-okta-auth-v0-7-0` — the guard requires the PR title to slugify to exactly the branch name, and `deps-okta-auth-v0-7-0` would force the nonsense title "deps okta auth v0 7 0".
+
+### Open questions
+
+- None.
+
+### Verification
+
+Acceptance criteria, run against the committed branch content (marquee's working tree is on `main`, so reading its file in place shows the old pin):
+
+```
+$ rg -N --no-filename -o 'okta-auth = .*tag = "[^"]*"' <the four Cargo.toml at their branch> \
+    | sed 's/.*tag = "//; s/".*//' | sort -u
+v0.7.0
+count: 1
+
+$ rg -c 'okta-auth = .*version =' <the four Cargo.toml at their branch> | wc -l
+0
+
+$ rg -c 'no `offline_access`|silent-refresh Okta path' slack-cli/README.md sdv/sdv.yml sdv/CLAUDE.md
+(no output; rg exit 1; 0 lines)
+```
+
+Every consumer was verified to BUILD against the new crate, not a cached artifact: `cargo clean -p okta-auth` then a full `otto ci` in each repo.
+
+```
+slack-cli    [test] Compiling okta-auth v0.7.0 (https://github.com/tatari-tv/okta-auth-rs?tag=v0.7.0#d830c400)      [ci] All CI checks passed!
+sdv          [test] Compiling okta-auth v0.7.0 (https://github.com/tatari-tv/okta-auth-rs.git?tag=v0.7.0#d830c400)  [ci] All CI checks passed!
+persona-cli  [test] Compiling okta-auth v0.7.0 (https://github.com/tatari-tv/okta-auth-rs.git?tag=v0.7.0#d830c400)  [ci] All CI checks passed!
+marquee      Checking okta-auth v0.7.0 (https://github.com/tatari-tv/okta-auth-rs.git?tag=v0.7.0#d830c400)          (fresh worktree + empty target dir)
+```
+
+All four lockfiles resolve the tag to the same commit, matching the annotated tag:
+`?tag=v0.7.0#d830c400a6b5ee408c794e92e6350ddbd4c9ecf6`.
+
+Break-to-prove on the slack-cli `logout` fix. Restoring the original `auth.logout()?` as the first statement and running the new test:
+
+```
+test auth::tests::logout_clears_slack_cache_even_when_okta_revoke_fails ... FAILED
+
+thread 'auth::tests::logout_clears_slack_cache_even_when_okta_revoke_fails' panicked at src/auth/tests.rs:119:5:
+the Slack token cache must be deleted even when Okta's revoke fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 808 filtered out
+```
+
+It fails on the assertion, not on a panic, and passes again once the fix is restored.
+
+### Environment note for later phases
+
+A cargo hazard in the same class as the shared-`target/` staleness seen in okta-auth-rs, but a distinct mechanism. A `cargo` run under a sandbox that denies `sccache` caches the FAILED rustc probe in `target/.rustc_info.json`:
+
+```json
+{"rustc_fingerprint":4608563470856345331,"outputs":{"9168926135673273736":
+{"success":false,"status":"exit status: 2","code":2,"stdout":"",
+"stderr":"sccache: error: Operation not permitted (os error 1)\n"}},"successes":{}}
+```
+
+Cargo then replays that cached failure on every later run in that repo, sandbox or not, so the repo looks permanently broken while its neighbours build fine. It hit sdv and persona-cli here. The tell is a 221-byte `.rustc_info.json` against ~1.3k in a healthy repo. Deleting the file fixes it; no code change is warranted.
