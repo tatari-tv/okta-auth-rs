@@ -518,7 +518,7 @@ CI after the fix:
   `refresh_invalid_grant_with_failed_clear_returns_cache_write`,
   `get_token_propagates_cache_write_instead_of_opening_browser`,
   `login_or_reuse_propagates_cache_write_instead_of_opening_browser`.
-- **Two parity-named tests per port, identical snake_case names across both trees** -
+- **Two parity-named tests per port, matching snake_case suffixes with Python's `test_` prefix** -
   `logout_clears_cache_when_cache_file_is_unreadable` and
   `fresh_grant_proceeds_when_cache_file_is_unreadable`. Each writes a genuinely invalid
   JSON cache file (`{ not json` / `{ this is not json`) and asserts the recovery
