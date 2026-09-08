@@ -219,13 +219,26 @@ impl OktaAuth {
     /// The cached refresh token, refreshed, if the cache holds one - `Ok(None)` when
     /// there is no refresh token or the refresh itself fails (e.g. `invalid_grant`,
     /// which `refresh()` already turns into a cleared cache). Shared by
-    /// `login_or_reuse`'s silent-refresh arm.
+    /// `login_or_reuse`'s silent-refresh arm. `CacheWrite` is the one error that does
+    /// NOT collapse to `Ok(None)`: it means the dead-token clear failed on the
+    /// filesystem, so the browser login this would otherwise fall through to would
+    /// just fail at `cache::save` anyway - the same reasoning `get_token` applies.
     fn try_silent_refresh(&self) -> Result<Option<TokenCache>, OktaAuthError> {
         let dir = self.cache_dir();
         let Some(refresh_token) = cache::load(&dir)?.and_then(|c| c.refresh_token) else {
             return Ok(None);
         };
-        Ok(self.refresh(&refresh_token).ok())
+        match self.refresh(&refresh_token) {
+            Ok(new_cache) => Ok(Some(new_cache)),
+            Err(OktaAuthError::CacheWrite(msg)) => {
+                warn!("try_silent_refresh: refresh failed to clear a dead cache entry ({msg}); propagating CacheWrite");
+                Err(OktaAuthError::CacheWrite(msg))
+            }
+            Err(e) => {
+                warn!("try_silent_refresh: silent refresh failed: {e}");
+                Ok(None)
+            }
+        }
     }
 
     /// Returns a valid access token. Refreshes or re-authenticates as needed.
@@ -382,8 +395,9 @@ impl OktaAuth {
     /// the new grant -> best-effort revoke the previous token. The old token is read
     /// once, before `flow` runs, and never re-read from disk after the save, so this
     /// call can never revoke the grant it just wrote (e.g. a concurrent `login --force`
-    /// elsewhere). A revoke failure is never an `Err`: it comes back as `Some(text)` in
-    /// the tuple (and is `warn!`-logged) for the caller to surface to the user.
+    /// elsewhere), and the revoke is skipped outright when the two tokens are equal. A
+    /// revoke failure is never an `Err`: it comes back as `Some(text)` in the tuple
+    /// (and is `warn!`-logged) for the caller to surface to the user.
     fn fresh_grant(
         &self,
         flow: impl FnOnce() -> Result<TokenCache, OktaAuthError>,
@@ -398,6 +412,17 @@ impl OktaAuth {
         cache::save(&dir, &new_cache)?;
 
         let revoke_warning = match old_refresh_token {
+            // This tenant runs "Use persistent token": `/v1/token` echoes the SAME
+            // refresh token back on the refresh path (Phase 0 measured it byte-for-byte).
+            // Whether a second *interactive* authorization for the same user+client also
+            // re-issues that same token is untested. If it does, revoking `old` here
+            // would kill the grant the `cache::save` above just wrote - and the access
+            // token with it, since Phase 0 also proved a revoke takes both. Comparing
+            // first costs nothing and is correct whichever way the tenant behaves.
+            Some(ref token) if Some(token) == new_cache.refresh_token.as_ref() => {
+                debug!("fresh_grant: re-authorization returned the same refresh token; skipping revoke");
+                None
+            }
             Some(token) => self.revoke(&token).err().map(|e| {
                 warn!("fresh_grant: could not revoke the previous refresh token: {e}");
                 e.to_string()
@@ -513,8 +538,16 @@ mod tests {
     /// request in turn, then stops; records every request's path and form body.
     struct MockOkta {
         base_url: String,
+        expected: usize,
         handle: std::thread::JoinHandle<Vec<RecordedRequest>>,
     }
+
+    /// How long [`MockOkta`] waits for each scripted request before giving up. Every
+    /// request is local and immediate, so this only ever elapses when the code under
+    /// test made fewer requests than the script holds - which must fail the test, not
+    /// hang it. A blocking `recv()` here made mutation testing impractical: neutralize
+    /// a revoke and the suite hung indefinitely instead of reporting the missing call.
+    const MOCK_RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
     impl MockOkta {
         /// Start serving `responses` in order against a fresh local port. `cache_dir`
@@ -523,10 +556,13 @@ mod tests {
         fn start(responses: Vec<ScriptedResponse>, cache_dir: PathBuf) -> Self {
             let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
             let port = server.server_addr().to_ip().unwrap().port();
+            let expected = responses.len();
             let handle = std::thread::spawn(move || {
                 let mut recorded = Vec::new();
                 for (status, body) in responses {
-                    let Ok(mut req) = server.recv() else { break };
+                    let Ok(Some(mut req)) = server.recv_timeout(MOCK_RECV_TIMEOUT) else {
+                        break;
+                    };
                     let path = req.url().to_string();
                     let mut raw = String::new();
                     let _ = req.as_reader().read_to_string(&mut raw);
@@ -553,14 +589,24 @@ mod tests {
             });
             Self {
                 base_url: format!("http://127.0.0.1:{port}"),
+                expected,
                 handle,
             }
         }
 
-        /// Block until the script is exhausted (or the caller has made all its
-        /// requests) and return everything recorded, in order.
+        /// Block until the script is exhausted and return everything recorded, in
+        /// order. Panics when the caller made fewer requests than the script holds:
+        /// the whole point of scripting a request is that it has to happen.
         fn finish(self) -> Vec<RecordedRequest> {
-            self.handle.join().unwrap()
+            let expected = self.expected;
+            let recorded = self.handle.join().unwrap();
+            assert_eq!(
+                recorded.len(),
+                expected,
+                "MockOkta::finish: script held {expected} request(s), received {} within {MOCK_RECV_TIMEOUT:?}",
+                recorded.len()
+            );
+            recorded
         }
     }
 
@@ -1803,5 +1849,105 @@ mod tests {
         assert!(matches!(result, Err(OktaAuthError::CacheWrite(_))), "got {result:?}");
         assert_eq!(interactive_calls.load(Ordering::SeqCst), 0);
         mock.finish();
+    }
+
+    #[test]
+    fn login_or_reuse_propagates_cache_write_instead_of_opening_browser() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ro-cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        cache::save(
+            &dir,
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: Some("dead-refresh".to_string()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+        let mock = MockOkta::start(vec![(400, r#"{"error":"invalid_grant"}"#)], dir.clone());
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(dir.clone()),
+        };
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let interactive_calls = Arc::new(AtomicUsize::new(0));
+        let device_calls = Arc::new(AtomicUsize::new(0));
+        let flow = CountingFlow {
+            interactive_calls: Arc::clone(&interactive_calls),
+            device_calls,
+            result: TokenCache {
+                access_token: "browser-access".to_string(),
+                refresh_token: None,
+                expires_at: now_secs() + 3600,
+            },
+        };
+        let auth = OktaAuth::with_flow(config, Box::new(flow));
+        let result = auth.login_or_reuse(false, false);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(result, Err(OktaAuthError::CacheWrite(_))), "got {result:?}");
+        assert_eq!(interactive_calls.load(Ordering::SeqCst), 0);
+        mock.finish();
+    }
+
+    // -- fresh_grant: never revoke the token it just saved --
+
+    #[test]
+    fn fresh_grant_skips_revoke_when_token_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-access".to_string(),
+                refresh_token: Some("persistent-refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            // Unreachable: a revoke attempt would connect-refuse and surface as a
+            // revoke_warning. `None` is the proof that no request was made at all.
+            okta_issuer: "http://127.0.0.1:1".to_string(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let flow = CountingFlow {
+            interactive_calls: Arc::new(AtomicUsize::new(0)),
+            device_calls: Arc::new(AtomicUsize::new(0)),
+            // Same refresh token back: what "Use persistent token" does on the refresh
+            // path, and what re-authorization may do too.
+            result: TokenCache {
+                access_token: "new-access".to_string(),
+                refresh_token: Some("persistent-refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        };
+        let auth = OktaAuth::with_flow(config, Box::new(flow));
+
+        let outcome = auth.login_or_reuse(true, false).unwrap();
+        let LoginOutcome::LoggedIn { revoke_warning, .. } = outcome else {
+            panic!("got {outcome:?}");
+        };
+        assert_eq!(revoke_warning, None);
+        // The grant that was just saved is still the one on disk, un-revoked. The
+        // inequality half of this rule is `login_saves_new_grant_before_revoking_old`,
+        // which records the outgoing /v1/revoke for a genuinely different token.
+        let reloaded = cache::load(tmp.path()).unwrap().unwrap();
+        assert_eq!(reloaded.access_token, "new-access");
+        assert_eq!(reloaded.refresh_token.as_deref(), Some("persistent-refresh"));
     }
 }

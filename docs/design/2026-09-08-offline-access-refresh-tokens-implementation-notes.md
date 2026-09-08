@@ -314,3 +314,159 @@ pass (verified individually and as part of the full 107-test run):
 - None beyond what Phase 1 already surfaced (`OKTA_AUTH_TAG` / release tag remains
   the parent orchestrator's job at the finalization checkpoint, not this phase's -
   this commit lands untagged, `pyproject.toml` version unchanged at `0.3.0`).
+
+---
+
+## Audit remediation (Phases 0-2)
+
+Remediation pass over the already-committed Phase 1 (`okta-auth-rs:5465ce8`) and Phase 2
+(`okta-auth-py:e4a023d`) work, driven by the implementation audit. Not a new phase: no
+Phase 3/4 work, no version bump, no tag, no push. Two commits, one per repo.
+
+CI after the pass:
+- `okta-auth-rs`: `otto ci` green - `whitespace -r` clean, no `_variable` bindings,
+  `cargo check --all-targets --all-features`, `cargo clippy -- -D warnings`,
+  `cargo fmt --all --check`, `cargo test --all-features` **104 passed, 0 failed**
+  (102 before this pass; +2 new tests).
+- `okta-auth-py`: `otto ci` green - `ruff format --check .`, `ruff check .`,
+  `mypy src/okta_auth`, `pytest -v` **109 passed** (107 before this pass; +2 new tests).
+
+### Break-to-prove runs, Phase 1 (okta-auth-rs)
+
+`doc:668-671` requires these four recorded here; the Phase 1 entry recorded only CI
+green and a test inventory. Run against the remediated tree. Each mutation was applied
+to a pristine copy of `src/lib.rs`, the single test run with
+`cargo test --all-features tests::<name> -- --exact`, and the file restored - sha256
+`24a1aace425e42851e01b6ccc2cec517cf6ee4eaa85ff4f4e78c505d9727bb37` verified identical
+before the first mutation and after the last.
+
+| # | mutation | test | exit | observed failure |
+|---|---|---|---|---|
+| R1 | `cache::clear(&dir)?;` commented out of `logout()` | `logout_revokes_refresh_token_then_clears_cache` | 101 | `panicked at src/lib.rs:1036: assertion failed: !tmp.path().join("tokens.json").exists()` |
+| R2 | silent-refresh arm in `login_or_reuse` wrapped in `if false { ... }` | `login_or_reuse_refreshes_instead_of_prompting` | 101 | `panicked at src/lib.rs:1184: got LoggedIn { cache_path: "/tmp/.tmpmRDCRh/tokens.json", revoke_warning: None }` |
+| R3 | `cache::clear(&self.cache_dir())?;` commented out of `refresh()`'s `invalid_grant` arm | `refresh_clears_cache_on_invalid_grant` | 101 | `panicked at src/lib.rs:1283: assertion failed: !tmp.path().join("tokens.json").exists()` |
+| R4 | shared-cache guard removed from `fresh_grant()` | `login_with_shared_cache_requires_offline_access` | 101 | `panicked at src/lib.rs:1479: got Ok(())` |
+
+R2 uses `if false { ... }` rather than a plain comment-out because commenting the arm
+out leaves `try_silent_refresh` uncalled, which `#![deny(dead_code)]` rejects at compile
+time - the mutation would never reach the test.
+
+A fifth, non-required mutation was run to verify the `MockOkta::finish()` fix below:
+neutralizing `logout()`'s revoke (`refresh_token.map(|_| Ok(()))`) and running
+`logout_treats_200_with_error_body_as_success` now **fails in 6.4s** with
+`MockOkta::finish: script held 1 request(s), received 0 within 5s`. Before the fix the
+auditor ran the same mutation and it hung for over nine minutes without producing a
+result.
+
+### Break-to-prove runs, Phase 2 (okta-auth-py)
+
+`doc:700` requires the same four. Same method: mutation applied to a pristine copy of
+`src/okta_auth/auth.py`, single test run with
+`uv run pytest -q tests/test_auth.py::<name>`, file restored - sha256
+`3e4b90bcc150814195a3206379c7f188c90cd9b45a131b6ba352ab81c00ac252` verified identical
+before and after.
+
+| # | mutation | test | exit | observed failure |
+|---|---|---|---|---|
+| P1 | `logout()`'s revoke disabled: `if False and refresh_token is not None:` | `test_logout_revokes_refresh_token_then_clears_cache` | 1 | `tests/test_auth.py:413: assert len(scripted.recorded) == 1` -> `assert 0 == 1  where 0 = len([])` |
+| P2 | silent refresh disabled in `login_or_reuse`: `new_cache = None` | `test_login_or_reuse_refreshes_instead_of_prompting` | 1 | `tests/test_auth.py:518: assert <LoginOutcomeKind.LOGGED_IN: 3> is <LoginOutcomeKind.REFRESHED: 2>` |
+| P3 | `cache.clear(self.cache_dir())` disabled in `_refresh`'s `invalid_grant` branch | `test_refresh_clears_cache_on_invalid_grant` | 1 | `tests/test_auth.py:573: assert not True  where True = exists()` (the dead token stayed cached) |
+| P4 | `raise SharedCacheRequiresOfflineAccessError()` disabled in `_fresh_grant` | `test_login_with_shared_cache_requires_offline_access` | 1 | `tests/test_auth.py:683: Failed: DID NOT RAISE SharedCacheRequiresOfflineAccessError` |
+
+All eight runs match what the audit reported. None differed.
+
+### Tests added by this pass
+
+Beyond the twenty-three parity names, both trees now carry:
+- `fresh_grant_skips_revoke_when_token_unchanged` /
+  `test_fresh_grant_skips_revoke_when_token_unchanged` - the equality guard below. The
+  inequality half (revoke still fires when the tokens differ) is already pinned by
+  `login_saves_new_grant_before_revoking_old`, which records the outgoing `/v1/revoke`.
+- `login_or_reuse_propagates_cache_write_instead_of_opening_browser` /
+  `test_login_or_reuse_propagates_cache_write_instead_of_opening_browser` - the
+  `CacheWrite` precedence deviation below.
+
+### Design decisions
+- **`fresh_grant` never revokes a token equal to the one it just saved**
+  (`src/lib.rs:fresh_grant`, `auth.py:OktaAuth._fresh_grant`). Phase 0 proved this
+  tenant runs "Use persistent token" and echoes the refresh token back byte-identically
+  on `POST /v1/token grant_type=refresh_token` (`implementation-notes.md:36-40`). Phase
+  0 never ran a *second interactive authorization* for the same user+client, so nothing
+  establishes that re-authorization mints a *distinct* refresh token - yet
+  `doc:554` ("each login mints its own refresh token") asserts it, and `fresh_grant`
+  depended on it totally: read old -> flow -> save new -> revoke old. If persistence
+  extends to re-authorization the way it demonstrably extends to refresh, the revoke
+  destroys the credential the `save` on the previous line just wrote, and with it the
+  access token (Phase 0 also proved a revoke kills the associated access token,
+  `implementation-notes.md:53-56`). Comparing the two tokens first is correct whichever
+  way the tenant behaves, costs one string comparison, and does not wait on the
+  empirical answer. The comparison lives at the revoke site with a comment explaining
+  the tenant behavior it defends against, because nothing in the surrounding code makes
+  the hazard visible.
+- **The old test could not have caught it.** `login_saves_new_grant_before_revoking_old`
+  hardcodes `old-refresh` against `new-refresh` (`src/lib.rs:1369`, `:1389` at audit
+  time); the equal-token case was unrepresented in both trees. The new test uses an
+  unreachable issuer (Rust) / `_post_must_not_be_called` (Python) so that any revoke
+  attempt is observable, and asserts the saved grant is still on disk afterwards.
+- **`MockOkta::finish()` fails instead of deadlocking** (`src/lib.rs`, test module). The
+  server thread now uses `tiny_http::Server::recv_timeout(MOCK_RECV_TIMEOUT)` (5s) and
+  `finish()` asserts `recorded.len() == expected`, naming both counts. Previously the
+  thread blocked in `recv()` forever and `finish()` joined it, so a mutation that
+  removed a request hung the suite rather than failing it - the doc comment claimed
+  otherwise ("or the caller has made all its requests"), and that parenthetical was
+  never implemented. This is the root cause of the Rust half of the missing
+  break-to-prove record: the runs were impractical, not merely unwritten.
+
+### Deviations
+- **`login_or_reuse` now propagates `CacheWrite` instead of swallowing it and opening a
+  browser** (`src/lib.rs:try_silent_refresh`, `auth.py:OktaAuth._try_silent_refresh`).
+  This is a **deliberate deviation from `doc:406-409`**, which names only `get_token()`
+  and `get_token_noninteractive()` as the `CacheWrite`-propagating paths, and from the
+  `login_or_reuse` sketch at `doc:362-365`, where a failed refresh always falls through
+  to the flow. The design's own justification for the other two paths applies verbatim
+  to this one: an `invalid_grant` whose cache-clear failed means the filesystem is the
+  fault, so the browser login it would fall through to would just fail at `cache::save`
+  with the same error, after taking the user through a login. Both audit seats found
+  this independently. **This entry is the evidence for amending `doc:406-409` at
+  finalization** to name all three paths; the doc was not edited here.
+- Everything else in this pass is a fix to shipped code or docs, not a departure from
+  the design.
+
+### Tradeoffs
+- **Equality guard now vs. a Phase 0 addendum first.** The addendum (two back-to-back
+  device grants, compare the two `refresh_token` values) is what actually settles how
+  the tenant behaves, but it needs two browser approvals from a human and is being run
+  separately. The guard is correct under either answer, so it ships now and the
+  addendum stays owed. Cost if the tenant does rotate on re-authorization: one wasted
+  string comparison per fresh grant.
+- **5s `MOCK_RECV_TIMEOUT` rather than a shorter one.** Every request in these tests is
+  local and immediate, so the timeout only elapses on a genuine shortfall; 5s is slack
+  for a loaded CI box without making a real failure slow to surface (6.4s wall for the
+  verification run above, including compile).
+- **Python `get_token` moves `cache.save` into an `else:` clause** rather than
+  restructuring the try/except. Behavior is unchanged (a `CacheWriteError` from the save
+  still propagates); what changes is that it is no longer logged as "refresh failed to
+  clear a dead cache entry", which was simply false for a save failure. Rust already had
+  the save outside that arm (`src/lib.rs:244`), so this is Python catching up.
+- **Python README brought to Rust parity by porting the Rust prose**, not by writing a
+  Python-native document. The two ports describing the same product in the same words is
+  worth more than independent phrasing; the only intentional divergences are the
+  language-level ones (`SharedCacheRequiresOfflineAccessError` vs the Rust variant,
+  `LoginOutcomeKind.REFRESHED` vs `LoginOutcome::Refreshed`, and a source-compatibility
+  note about branching on the enum rather than Rust's `#[non_exhaustive]` note).
+
+### Open questions
+- **Does a second interactive authorization for the same user+client mint a distinct
+  refresh token on this tenant?** Unresolved, and it needs two browser approvals from a
+  human to answer. The guard above makes the code correct either way, but the answer
+  decides whether `doc:554` ("Two machines: each login mints its own refresh token") is
+  true as written or needs correcting. If the tenant echoes the same token, `doc:554` is
+  wrong and the "logout on one machine leaves the other logged in" claim beneath it is
+  wrong too - a `logout` would kill both machines. That is a behavioral claim in the
+  shipped Rust README ("7 idle days, an explicit revoke...") and in the Python one now,
+  so it should be settled before either is tagged.
+- **`doc:406-409` needs amending** to name `login_or_reuse` alongside the two
+  `get_token*` paths, per the Deviations entry above. Doc edits are the parent's call at
+  finalization; not done here.
+- Release tags for both repos remain owed and unowned by this pass, as Phase 1 and
+  Phase 2 already recorded.
