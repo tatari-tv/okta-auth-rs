@@ -97,8 +97,10 @@ pub fn save(dir: &Path, cache: &TokenCache) -> Result<(), OktaAuthError> {
 
     // Atomic publish: POSIX rename(2) is atomic, so a concurrent reader always sees
     // either the old or the new complete file, never a torn write. Concurrent writers
-    // => last writer wins, which is correct here: every token minted for the same
-    // client is equivalent.
+    // => last writer wins: the loser's grant is revoked by nobody and dies after 7
+    // idle days on its own. No writer ever revokes a token it did not itself read as
+    // "old" before its flow began, so this can strand a grant but never revoke one
+    // still in use.
     if let Err(e) = fs::rename(&temp_path, &path) {
         let _ = fs::remove_file(&temp_path);
         return Err(OktaAuthError::CacheWrite(e.to_string()));

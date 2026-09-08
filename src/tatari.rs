@@ -31,8 +31,11 @@ pub const CLIENT_ID: &str = "0oa144xsutkeO1nev698";
 /// cutover.
 pub const REDIRECT_URI: &str = "http://local.tatari.tools:11313/callback";
 
-/// Default OAuth2 scopes (identity claims only).
-pub const SCOPES: &[&str] = &["openid", "email", "profile"];
+/// Default OAuth2 scopes. `offline_access` is what makes a login mint a refresh
+/// token; without it, every consumer's access token dies with no way to renew it
+/// silently. See the shared cache write guard in `OktaAuth::fresh_grant` for why the
+/// crate refuses to write a grant missing this scope into the shared default cache.
+pub const SCOPES: &[&str] = &["openid", "email", "profile", "offline_access"];
 
 #[cfg(test)]
 mod tests {
@@ -43,6 +46,6 @@ mod tests {
         assert!(ISSUER.starts_with("https://"));
         assert!(!CLIENT_ID.is_empty());
         assert!(REDIRECT_URI.starts_with("http://"));
-        assert_eq!(SCOPES, ["openid", "email", "profile"]);
+        assert_eq!(SCOPES, ["openid", "email", "profile", "offline_access"]);
     }
 }
