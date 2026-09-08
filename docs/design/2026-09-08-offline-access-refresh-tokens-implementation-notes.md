@@ -71,11 +71,12 @@ Observed, in order:
   header returned 200. The doc's request shape needed no adjustment.
 
 ### Open questions
-- **Did a consent screen appear?** The phase asks that this be recorded and it is the
-  one item only Scott can answer: the approval happened in his browser, out of band
-  from the polling loop. Not a gate on any later phase (the doc already rules both
-  outcomes acceptable: "Either outcome is acceptable"), but the record is incomplete
-  until he says. To be filled in.
+- **Consent screen: not recorded, and closed as immaterial.** The phase asked whether
+  a consent page appeared during the browser approval. It was not captured at the time
+  and the question is now closed rather than chased: the design doc already rules both
+  outcomes acceptable ("Either outcome is acceptable"), nothing in either port branches
+  on it, and no later phase reads it. Recorded here as unanswered by choice, not as an
+  oversight to revisit.
 
 ## Phase 1: okta-auth-rs
 
