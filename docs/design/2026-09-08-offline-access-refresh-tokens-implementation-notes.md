@@ -531,21 +531,25 @@ CI after the fix:
   corrupt cache yields no token, therefore no revoke request.
 
 ### Deviations
-- **Rust shipped a catch-all `Err(e) => None` in `v0.7.0` and was narrowed immediately
-  after; Python was narrow from the first commit.** Both ports now name the two errors
-  they absorb - `CacheRead`/`CacheParse` in Rust, `CacheParseError`/`CacheReadError` in
-  Python - so a parity check should read one story, not two. The window in between was
-  not a behavioral gap: `cache::load` has exactly two error surfaces, `CacheRead` at
-  `src/cache.rs:80` (the `read_to_string` failure) and `CacheParse` at `src/cache.rs:81`
-  (the `serde_json::from_str` failure), and every other path through the function
-  returns `Ok`, so no error the catch-all absorbed was one the named match would have
-  propagated. The narrowing is hygiene against a future variant on the credential path,
-  not a defect fix, which is why it was a separate PR against `main` rather than a
-  reason to re-cut a tag four consumer repos were pinning.
-- **`v0.7.0`'s Rust warnings logged the error but not the cache path; Python's named it
-  from the start.** Closed in `okta-auth-rs#21` alongside the narrowing: both ports now
-  log `cache_path`, so the operator reading the log is told which file to remove. It was
-  an operator-facing gap only, never behavioral.
+- **The two ports absorb the same errors by different means, and the difference is
+  unintended.** Python catches `CacheParseError`/`CacheReadError` by name; Rust
+  `v0.7.0`, and `main`, match `Err(e)` for every variant. Narrow was asked for in both;
+  Rust went wide because it was written that way while the fix was being made in-flight,
+  not because anyone chose the looser shape. It is not a defect today: `cache::load` has
+  exactly two error surfaces, `CacheRead` at `src/cache.rs:80` (the `read_to_string`
+  failure) and `CacheParse` at `src/cache.rs:81` (the `serde_json::from_str` failure),
+  and every other path through the function returns `Ok`, so no error the catch-all
+  absorbs is one the named match would have propagated. It is still the weaker shape -
+  it silently widens the first time `load` grows a variant, on the credential path - so
+  it resolves toward Python, narrow, in the next change that touches `src/lib.rs`. It is
+  deliberately not being fixed on its own: the diff changes nothing observable, and it
+  would spend an SRE CODEOWNER review on a no-op in the repo that owns the credential
+  path. **Direction is fixed: Rust converges toward Python, never the reverse.**
+- **The Rust warnings log the error but not the cache path; Python's name the path.**
+  Python logs `cache.cache_path(directory)` in both messages so the operator reading the
+  log is told which file to remove; Rust logs the error only. Operator-facing gap, never
+  behavioral, and it rides along with the narrowing above whenever `src/lib.rs` is next
+  touched.
 - **This entry is not a phase.** No version bump, no tag, no status flip - it documents
   a defect fix against already-committed Phase 1/Phase 2 work.
 
@@ -582,8 +586,11 @@ In every run the *other* test of the pair still passed, so each test binds its o
 rather than both tests riding on one fix.
 
 ### Open questions
-- **None outstanding on this fix.** The one item that was open - narrowing the two Rust
-  matches and naming the cache path in the two Rust warnings, both to match Python - is
-  done in `okta-auth-rs#21`, which carries no version bump by explicit decision: it has
-  no behavioral difference (see the Deviations entry and `src/cache.rs:80-81`) and rides
-  whatever tag comes next rather than churning the four consumer pins on `v0.7.0`.
+- **One known follow-up, deliberately deferred rather than open:** narrow the two Rust
+  matches to `CacheRead`/`CacheParse` and name the cache path in the two Rust warnings,
+  both to match Python. Neither changes behavior (see the Deviations entries and
+  `src/cache.rs:80-81`), so neither justifies its own PR against the repo that owns the
+  credential path, nor a re-cut of the `v0.7.0` tag that consumer repos are pinning.
+  It lands with the next change that touches `src/lib.rs`. Recorded here so that change
+  knows to carry it, and so a future parity pass resolves the difference toward Python
+  rather than away from it.
