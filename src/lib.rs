@@ -382,13 +382,18 @@ impl OktaAuth {
         let dir = self.cache_dir();
         // Best-effort, NOT `?`: a cache we cannot read holds no refresh token we could
         // revoke, and propagating here would return before `clear` and leave a corrupt
-        // cache file undeletable by the very command whose job is to delete it.
+        // cache file undeletable by the very command whose job is to delete it. Named
+        // variants, not a catch-all: only an unreadable/unparseable file is "no token".
         let refresh_token = match cache::load(&dir) {
             Ok(cached) => cached.and_then(|c| c.refresh_token),
-            Err(e) => {
-                warn!("logout: could not read the token cache ({e}); clearing it anyway");
+            Err(e @ (OktaAuthError::CacheRead(_) | OktaAuthError::CacheParse(_))) => {
+                warn!(
+                    "logout: could not read the token cache at {} ({e}); clearing it anyway",
+                    cache::cache_path(&dir).display()
+                );
                 None
             }
+            Err(e) => return Err(e),
         };
         let revoke_result = refresh_token.map(|token| self.revoke(&token));
         cache::clear(&dir)?;
@@ -420,14 +425,18 @@ impl OktaAuth {
         // Best-effort, NOT `?`: the previous token is only wanted so it can be revoked
         // after the new grant lands. Propagating here would return before `flow` and
         // `save`, so a corrupt cache file would block the one path that overwrites it.
+        // Named variants, not a catch-all: only an unreadable/unparseable file is
+        // "no previous token".
         let old_refresh_token = match cache::load(&dir) {
             Ok(cached) => cached.and_then(|c| c.refresh_token),
-            Err(e) => {
+            Err(e @ (OktaAuthError::CacheRead(_) | OktaAuthError::CacheParse(_))) => {
                 warn!(
-                    "fresh_grant: could not read the previous token cache ({e}); proceeding without revoking a previous token"
+                    "fresh_grant: could not read the previous token cache at {} ({e}); proceeding with no token to revoke",
+                    cache::cache_path(&dir).display()
                 );
                 None
             }
+            Err(e) => return Err(e),
         };
 
         let new_cache = flow()?;
