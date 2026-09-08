@@ -380,7 +380,16 @@ impl OktaAuth {
     /// revoke returns `RevokeFailed` (the server-side token may still be live).
     pub fn logout(&self) -> Result<(), OktaAuthError> {
         let dir = self.cache_dir();
-        let refresh_token = cache::load(&dir)?.and_then(|c| c.refresh_token);
+        // Best-effort, NOT `?`: a cache we cannot read holds no refresh token we could
+        // revoke, and propagating here would return before `clear` and leave a corrupt
+        // cache file undeletable by the very command whose job is to delete it.
+        let refresh_token = match cache::load(&dir) {
+            Ok(cached) => cached.and_then(|c| c.refresh_token),
+            Err(e) => {
+                warn!("logout: could not read the token cache ({e}); clearing it anyway");
+                None
+            }
+        };
         let revoke_result = refresh_token.map(|token| self.revoke(&token));
         cache::clear(&dir)?;
         match revoke_result {
@@ -391,7 +400,9 @@ impl OktaAuth {
 
     /// The only writer of a fresh interactive grant - called by `login`, `login_device`,
     /// and `get_token`'s interactive fallthrough. Order: guard the shared-cache
-    /// invariant -> read the previous refresh token into memory -> run `flow` -> save
+    /// invariant -> read the previous refresh token into memory (best-effort: an
+    /// unreadable cache warns and yields `None` rather than blocking the re-login that
+    /// would overwrite it) -> run `flow` -> save
     /// the new grant -> best-effort revoke the previous token. The old token is read
     /// once, before `flow` runs, and never re-read from disk after the save, so this
     /// call can never revoke the grant it just wrote (e.g. a concurrent `login --force`
@@ -406,7 +417,18 @@ impl OktaAuth {
             return Err(OktaAuthError::SharedCacheRequiresOfflineAccess);
         }
         let dir = self.cache_dir();
-        let old_refresh_token = cache::load(&dir)?.and_then(|c| c.refresh_token);
+        // Best-effort, NOT `?`: the previous token is only wanted so it can be revoked
+        // after the new grant lands. Propagating here would return before `flow` and
+        // `save`, so a corrupt cache file would block the one path that overwrites it.
+        let old_refresh_token = match cache::load(&dir) {
+            Ok(cached) => cached.and_then(|c| c.refresh_token),
+            Err(e) => {
+                warn!(
+                    "fresh_grant: could not read the previous token cache ({e}); proceeding without revoking a previous token"
+                );
+                None
+            }
+        };
 
         let new_cache = flow()?;
         cache::save(&dir, &new_cache)?;
@@ -819,6 +841,57 @@ mod tests {
         let config = test_config(&tmp);
         let auth = OktaAuth::new(config);
         auth.logout().unwrap();
+    }
+
+    /// Regression: the refresh-token read added to `logout` must not be able to block
+    /// the `clear` that follows it. A corrupt cache file is exactly the case where the
+    /// user needs `logout` to work, so propagating the parse error would leave manual
+    /// `rm` as the only recovery.
+    #[test]
+    fn logout_clears_cache_when_cache_file_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("tokens.json"), "{ not json").unwrap();
+
+        let config = OktaAuthConfig {
+            // Unreachable: an attempted revoke would surface as RevokeFailed. Ok(()) is
+            // the proof that the unreadable cache yielded no token to revoke.
+            okta_issuer: "http://127.0.0.1:1".to_string(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+        auth.logout().unwrap();
+        assert!(!tmp.path().join("tokens.json").exists());
+    }
+
+    /// Regression: the previous-token read added to `fresh_grant` must not be able to
+    /// block `flow` and `save`. A corrupt cache file would otherwise brick `login`,
+    /// `login_device`, and the forced path - every route that overwrites it.
+    #[test]
+    fn fresh_grant_proceeds_when_cache_file_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("tokens.json"), "{ not json").unwrap();
+
+        let interactive_calls = Arc::new(AtomicUsize::new(0));
+        let device_calls = Arc::new(AtomicUsize::new(0));
+        let flow = CountingFlow {
+            interactive_calls: Arc::clone(&interactive_calls),
+            device_calls: Arc::clone(&device_calls),
+            result: TokenCache {
+                access_token: "flow-access".to_string(),
+                refresh_token: Some("flow-refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        };
+        let auth = OktaAuth::with_flow(test_config(&tmp), Box::new(flow));
+
+        auth.login().unwrap();
+        assert_eq!(interactive_calls.load(Ordering::SeqCst), 1);
+        let saved = cache::load(tmp.path()).unwrap().expect("cache overwritten");
+        assert_eq!(saved.access_token, "flow-access");
     }
 
     #[test]
