@@ -471,3 +471,121 @@ Beyond the twenty-three parity names, both trees now carry:
   finalization; not done here.
 - Release tags for both repos remain owed and unowned by this pass, as Phase 1 and
   Phase 2 already recorded.
+
+## Regression fix: corrupt cache blocked both recovery paths
+
+A regression this feature introduced in both ports, found by CodeRabbit on
+`tatari-tv/okta-auth-py#7` and confirmed against the Rust baseline: on `origin/main`
+before this work, `logout()` was `cache::clear(&dir)?` and nothing else, so it was
+self-healing against a corrupt token cache. The offline_access work inserted a
+`cache::load(&dir)?` ahead of the recovery action at two sites per port - `logout` and
+`fresh_grant`/`_fresh_grant`. Because `load` propagates `CacheParse`/`CacheRead`
+(`CacheParseError`/`CacheReadError`) on an unreadable or corrupt file, both escape
+hatches disappeared at once:
+
+- `logout` could no longer delete a corrupt cache: the command whose whole job is
+  deleting the bad file refused because it could not read the bad file.
+- `fresh_grant` reads the old token before running the flow and calling `cache::save`,
+  so `login`, `login_device`, and a forced `login_or_reuse` could no longer overwrite a
+  corrupt cache either.
+
+The user's only remaining fix was `rm` by hand, with nothing in the error pointing
+there.
+
+Fixed in `okta-auth-rs` on `feat/offline-access-refresh-tokens` as `e2592e3`, which
+landed on `main` in the `#19` squash (`d830c40`) and shipped in the annotated tag
+`v0.7.0` (dereferences to `d830c40`, `origin/main`'s tip). Fixed in `okta-auth-py` on
+`feat-auth-request-offline-access-refresh` as `39b5e41`, PR `#7`.
+
+CI after the fix:
+- `okta-auth-rs`: `otto ci` green at `d830c40` - `cargo test --all-features`
+  **106 passed, 0 failed** (104 before, +2 new tests), `[ci] OK: All CI checks passed!`.
+- `okta-auth-py`: `otto ci` green at `39b5e41` - `pytest` **111 passed** (109 before,
+  +2 new tests), `[ci] All CI checks passed!`.
+
+### Design decisions
+- **An unreadable cache reads as "no refresh token", not as an error** -
+  `src/lib.rs:logout`, `src/lib.rs:fresh_grant`, `src/okta_auth/auth.py:logout`,
+  `src/okta_auth/auth.py:_fresh_grant` - a cache we cannot parse holds no refresh token
+  we could revoke anyway, so best-effort-`None` is the honest reading of the file and it
+  is what restores the recovery path. Both call sites carry a comment saying exactly
+  that: this is the non-obvious case the comments rule says to comment.
+- **Only the two read errors are absorbed; every other error still propagates** - in
+  particular the `CacheWrite`/`CacheWriteError` precedence in `logout` (a failed `clear`
+  beats a failed revoke, because a revoked token still on disk is what `is_valid()`
+  would hand out) is untouched. Proven still to hold by the four pre-existing tests
+  that pin it, all still green in both ports: `logout_returns_cache_write_when_clear_fails`,
+  `refresh_invalid_grant_with_failed_clear_returns_cache_write`,
+  `get_token_propagates_cache_write_instead_of_opening_browser`,
+  `login_or_reuse_propagates_cache_write_instead_of_opening_browser`.
+- **Two parity-named tests per port, identical snake_case names across both trees** -
+  `logout_clears_cache_when_cache_file_is_unreadable` and
+  `fresh_grant_proceeds_when_cache_file_is_unreadable`. Each writes a genuinely invalid
+  JSON cache file (`{ not json` / `{ this is not json`) and asserts the recovery
+  *outcome*, not the absence of an exception: logout asserts `tokens.json` is gone
+  afterward; fresh_grant asserts the flow ran (`interactive_calls == 1`) and that the
+  new grant is the file on disk.
+- **No revoke may go out on either path** - both tests point the issuer at an
+  unreachable `127.0.0.1:1` (Rust) or assert on a `requests.post` that raises on any
+  call (Python), so "no attempted revoke" is an assertion rather than an assumption: a
+  corrupt cache yields no token, therefore no revoke request.
+
+### Deviations
+- **The two ports differ in strictness on purpose, and must not be "fixed" into
+  agreement.** Python catches `(CacheParseError, CacheReadError)` by name; Rust matches
+  `Err(e)` for every variant. Rust's is behaviorally identical *today*: `cache::load`
+  has exactly two error surfaces, `CacheRead` at `src/cache.rs:80` (the `read_to_string`
+  failure) and `CacheParse` at `src/cache.rs:81` (the `serde_json::from_str` failure),
+  and every other path through the function returns `Ok`. So no error the wide match can
+  absorb is one the narrow match would have propagated. It is still the weaker shape: it
+  silently widens the first time `load` grows a variant, and this is the credential path.
+  It was not re-opened because it had already shipped in `v0.7.0`, and re-cutting a tag
+  that four repos are about to pin is not worth a change with no behavioral difference.
+  The deliberate resolution: **Python stays narrow, Rust's wide match is a known
+  follow-up, and a future parity pass must converge Rust toward Python - never the
+  reverse.**
+- **The Python warnings name the cache file path; the Rust warnings do not.** Python
+  logs `cache.cache_path(directory)` in both messages; Rust logs the error only. Minor
+  parity gap in operator-facing output, not in behavior.
+- **This entry is not a phase.** No version bump, no tag, no status flip - it documents
+  a defect fix against already-committed Phase 1/Phase 2 work.
+
+### Tradeoffs
+- **Absorb the read error at the two recovery call sites** vs **make `cache::load`
+  itself lenient**. Absorbing at the call site keeps `load` honest for its other
+  callers - `cached_valid_token` still propagates `CacheParse` rather than silently
+  reporting "logged out", which is the behavior the audit already pinned. Only the two
+  functions whose next action destroys or overwrites the file get to shrug at it.
+- **Inline `try`/`match` at each of the two sites** vs **one shared best-effort helper
+  per port**. The duplicated block is five lines and the two comments are genuinely
+  different (one is "the clear must still run", the other is "the flow and save must
+  still run"). A shared helper would have collapsed both into one name and cost the
+  site-specific reasoning.
+- **Warn rather than silently continue.** A corrupt cache is a real event the operator
+  should see in `--debug` output even though it is not fatal here; swallowing it
+  entirely would make "why did it re-prompt me?" unanswerable.
+
+### Break-to-prove runs
+
+Each fix was reverted to the exact pre-fix expression, the matching test run, the
+failure observed, and the file restored. Rust was mutated in a throwaway `git worktree`
+at `d830c40` so the shared checkout was never left dirty; Python was mutated in place
+from a saved pristine copy and restored byte-for-byte.
+
+| # | mutation | test | observed failure |
+|---|---|---|---|
+| 1 | rs: `logout` best-effort match -> `cache::load(&dir)?` | `logout_clears_cache_when_cache_file_is_unreadable` | `panicked at src/lib.rs:860:23: called Result::unwrap() on an Err value: CacheParse("key must be a string at line 1 column 3")` - `test result: FAILED. 1 passed; 1 failed` |
+| 2 | rs: `fresh_grant` best-effort match -> `cache::load(&dir)?` | `fresh_grant_proceeds_when_cache_file_is_unreadable` | `panicked at src/lib.rs:883:22: called Result::unwrap() on an Err value: CacheParse("key must be a string at line 1 column 3")` - `test result: FAILED. 1 passed; 1 failed` |
+| 3 | py: `logout` `try`/`except` -> `cached = cache.load(directory)` | `test_logout_clears_cache_when_cache_file_is_unreadable` | `okta_auth.error.CacheParseError: Failed to parse token cache: Expecting property name enclosed in double quotes: line 1 column 3 (char 2)` raised from `src/okta_auth/cache.py:181` - `1 failed, 1 passed` |
+| 4 | py: `_fresh_grant` `try`/`except` -> `old_cached = cache.load(directory)` | `test_fresh_grant_proceeds_when_cache_file_is_unreadable` | same `CacheParseError` from `src/okta_auth/cache.py:181` - `1 failed, 1 passed` |
+
+In every run the *other* test of the pair still passed, so each test binds its own site
+rather than both tests riding on one fix.
+
+### Open questions
+- **Known follow-up, already decided in principle: narrow the two Rust matches to
+  `CacheParse`/`CacheRead`** so both ports name the errors they absorb, and **add the
+  cache path to the two Rust warnings** as Python's already do. Neither changes behavior
+  (see the Deviations entry and `src/cache.rs:80-81`), so both wait for the next change
+  that touches `src/lib.rs` rather than forcing a release. The direction is fixed: Rust
+  converges toward Python.
