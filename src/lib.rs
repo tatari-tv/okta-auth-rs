@@ -8,11 +8,11 @@ mod pkce;
 pub mod tatari;
 
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::{debug, info, warn};
-use oauth2::basic::BasicClient;
-use oauth2::{ClientId, RefreshToken, TokenResponse, TokenUrl};
+use oauth2::basic::{BasicClient, BasicErrorResponseType};
+use oauth2::{ClientId, RefreshToken, RequestTokenError, TokenResponse, TokenUrl};
 
 pub use cache::TokenCache;
 pub use error::OktaAuthError;
@@ -39,7 +39,13 @@ pub struct OktaAuthConfig {
 
 /// Outcome of [`OktaAuth::login_or_reuse`]. Carries the real cache path so the
 /// consumer's status line is always accurate (no hardcoded, drift-prone paths).
+///
+/// `#[non_exhaustive]`: adding `Refreshed` is source-breaking for any downstream
+/// exhaustive match in general. No consumer currently matches exhaustively (all call
+/// only `.message()`), and every consumer is tag-pinned, but the attribute forces a
+/// wildcard arm from here on so the next variant is not this conversation again.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LoginOutcome {
     /// A valid token was already cached; no flow ran. `since` is when it was cached
     /// (the cache file's mtime), if readable.
@@ -47,8 +53,19 @@ pub enum LoginOutcome {
         cache_path: PathBuf,
         since: Option<SystemTime>,
     },
+    /// Access token was expired; a silent refresh produced a new one. No flow ran.
+    Refreshed { cache_path: PathBuf },
     /// A login flow ran and cached a fresh token.
-    LoggedIn { cache_path: PathBuf },
+    // `#[non_exhaustive]` on the variant too: the enum attribute covers added
+    // variants, not added fields, and `revoke_warning` is a new field on an existing
+    // variant.
+    #[non_exhaustive]
+    LoggedIn {
+        cache_path: PathBuf,
+        /// `Some` when the previous refresh token (if any) could not be revoked
+        /// during this login. Never fails the login itself - see `fresh_grant`.
+        revoke_warning: Option<String>,
+    },
 }
 
 impl LoginOutcome {
@@ -64,8 +81,21 @@ impl LoginOutcome {
                     cache_path.display()
                 )
             }
-            Self::LoggedIn { cache_path } => {
-                format!("Logged in. Token cached at {}.", cache_path.display())
+            Self::Refreshed { cache_path } => {
+                format!("Refreshed Okta token (cached at {}).", cache_path.display())
+            }
+            Self::LoggedIn {
+                cache_path,
+                revoke_warning,
+            } => {
+                let mut msg = format!("Logged in. Token cached at {}.", cache_path.display());
+                if let Some(warning) = revoke_warning {
+                    msg.push_str(&format!(
+                        " Warning: the previous refresh token could not be revoked ({warning}); \
+                         it expires on its own after 7 idle days."
+                    ));
+                }
+                msg
             }
         }
     }
@@ -86,16 +116,48 @@ fn format_ago(since: SystemTime) -> String {
     }
 }
 
+/// Runs the interactive login flows. Injected so tests can assert "flow invoked / not
+/// invoked" and control the returned grant without touching Okta. Production is
+/// [`PkceFlow`], wrapping [`pkce::authorize`] / [`pkce::authorize_device`].
+trait LoginFlow {
+    fn interactive(&self, cfg: &OktaAuthConfig) -> Result<TokenCache, OktaAuthError>;
+    fn device(&self, cfg: &OktaAuthConfig) -> Result<TokenCache, OktaAuthError>;
+}
+
+/// Production [`LoginFlow`]: the real browser-redirect / device-grant flows against Okta.
+struct PkceFlow;
+
+impl LoginFlow for PkceFlow {
+    fn interactive(&self, cfg: &OktaAuthConfig) -> Result<TokenCache, OktaAuthError> {
+        pkce::authorize(&cfg.okta_issuer, &cfg.client_id, &cfg.redirect_uri, &cfg.scopes)
+    }
+
+    fn device(&self, cfg: &OktaAuthConfig) -> Result<TokenCache, OktaAuthError> {
+        pkce::authorize_device(&cfg.okta_issuer, &cfg.client_id, &cfg.scopes)
+    }
+}
+
 /// Okta OAuth2 PKCE authenticator for CLI tools.
 ///
 /// Handles the full token lifecycle: cache lookup, transparent refresh, and browser-based login.
 pub struct OktaAuth {
     config: OktaAuthConfig,
+    flow: Box<dyn LoginFlow + Send + Sync>,
 }
 
 impl OktaAuth {
     pub fn new(config: OktaAuthConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            flow: Box::new(PkceFlow),
+        }
+    }
+
+    /// Test-only constructor: swap in a fake [`LoginFlow`] so tests can assert flow
+    /// invocation and control the returned grant without touching Okta.
+    #[cfg(test)]
+    fn with_flow(config: OktaAuthConfig, flow: Box<dyn LoginFlow + Send + Sync>) -> Self {
+        Self { config, flow }
     }
 
     /// Returns a reference to the config.
@@ -131,16 +193,39 @@ impl OktaAuth {
     pub fn login_or_reuse(&self, force: bool, device: bool) -> Result<LoginOutcome, OktaAuthError> {
         debug!("login_or_reuse: force={force} device={device}");
         let cache_path = self.cache_path();
-        if !force && self.cached_valid_token()?.is_some() {
-            let since = std::fs::metadata(&cache_path).and_then(|m| m.modified()).ok();
-            return Ok(LoginOutcome::AlreadyLoggedIn { cache_path, since });
+        if !force {
+            if self.cached_valid_token()?.is_some() {
+                let since = std::fs::metadata(&cache_path).and_then(|m| m.modified()).ok();
+                return Ok(LoginOutcome::AlreadyLoggedIn { cache_path, since });
+            }
+            // Access token expired (or no cache at all): a live refresh token means
+            // `<tool> login` can stay silent instead of opening a browser for nothing.
+            if let Some(new_cache) = self.try_silent_refresh()? {
+                cache::save(&self.cache_dir(), &new_cache)?;
+                return Ok(LoginOutcome::Refreshed { cache_path });
+            }
         }
-        if device {
-            self.login_device()?;
+        let (_, revoke_warning) = if device {
+            self.fresh_grant(|| self.flow.device(&self.config))?
         } else {
-            self.login()?;
-        }
-        Ok(LoginOutcome::LoggedIn { cache_path })
+            self.fresh_grant(|| self.flow.interactive(&self.config))?
+        };
+        Ok(LoginOutcome::LoggedIn {
+            cache_path,
+            revoke_warning,
+        })
+    }
+
+    /// The cached refresh token, refreshed, if the cache holds one - `Ok(None)` when
+    /// there is no refresh token or the refresh itself fails (e.g. `invalid_grant`,
+    /// which `refresh()` already turns into a cleared cache). Shared by
+    /// `login_or_reuse`'s silent-refresh arm.
+    fn try_silent_refresh(&self) -> Result<Option<TokenCache>, OktaAuthError> {
+        let dir = self.cache_dir();
+        let Some(refresh_token) = cache::load(&dir)?.and_then(|c| c.refresh_token) else {
+            return Ok(None);
+        };
+        Ok(self.refresh(&refresh_token).ok())
     }
 
     /// Returns a valid access token. Refreshes or re-authenticates as needed.
@@ -159,6 +244,13 @@ impl OktaAuth {
                         cache::save(&dir, &new_cache)?;
                         return Ok(new_cache.access_token);
                     }
+                    Err(OktaAuthError::CacheWrite(msg)) => {
+                        // The dead-token clear itself failed: the filesystem is the
+                        // fault, not Okta, and a browser login would just fail to save
+                        // too. Propagate rather than opening a browser for nothing.
+                        warn!("get_token: refresh failed to clear a dead cache entry ({msg}); propagating CacheWrite");
+                        return Err(OktaAuthError::CacheWrite(msg));
+                    }
                     Err(e) => {
                         warn!("token refresh failed: {}, falling through to browser login", e);
                     }
@@ -167,14 +259,11 @@ impl OktaAuth {
         }
 
         info!("no valid cached token, starting browser login");
-        let token_cache = pkce::authorize(
-            &self.config.okta_issuer,
-            &self.config.client_id,
-            &self.config.redirect_uri,
-            &self.config.scopes,
-        )?;
-        cache::save(&dir, &token_cache)?;
-        Ok(token_cache.access_token)
+        let (new_cache, revoke_warning) = self.fresh_grant(|| self.flow.interactive(&self.config))?;
+        if let Some(warning) = revoke_warning {
+            warn!("get_token: {warning}");
+        }
+        Ok(new_cache.access_token)
     }
 
     /// Return a valid access token WITHOUT any interactive flow: cached token when
@@ -210,6 +299,16 @@ impl OktaAuth {
                         );
                         return Ok(new_cache.access_token);
                     }
+                    Err(OktaAuthError::CacheWrite(msg)) => {
+                        // The dead-token clear itself failed: the filesystem is the
+                        // fault, and the dead token is still on disk. That is a
+                        // different failure than "no controlling terminal", so it must
+                        // not collapse to NonInteractive.
+                        warn!(
+                            "get_token_noninteractive: refresh failed to clear a dead cache entry ({msg}); propagating CacheWrite"
+                        );
+                        return Err(OktaAuthError::CacheWrite(msg));
+                    }
                     Err(e) => {
                         // Log the real cause (Okta down / timeout / refresh-token rotation)
                         // before collapsing to NonInteractive, so headless drops stay
@@ -238,14 +337,10 @@ impl OktaAuth {
     /// [`login_device`]: OktaAuth::login_device
     pub fn login(&self) -> Result<(), OktaAuthError> {
         debug!("login: auto-detecting flow (browser vs device grant)");
-        let dir = self.cache_dir();
-        let token_cache = pkce::authorize(
-            &self.config.okta_issuer,
-            &self.config.client_id,
-            &self.config.redirect_uri,
-            &self.config.scopes,
-        )?;
-        cache::save(&dir, &token_cache)?;
+        let (_, revoke_warning) = self.fresh_grant(|| self.flow.interactive(&self.config))?;
+        if let Some(warning) = revoke_warning {
+            warn!("login: {warning}");
+        }
         Ok(())
     }
 
@@ -257,18 +352,89 @@ impl OktaAuth {
     /// [`login`]: OktaAuth::login
     pub fn login_device(&self) -> Result<(), OktaAuthError> {
         debug!("login_device: forcing device authorization grant");
-        let dir = self.cache_dir();
-        let token_cache =
-            pkce::authorize_device(&self.config.okta_issuer, &self.config.client_id, &self.config.scopes)?;
-        cache::save(&dir, &token_cache)?;
+        let (_, revoke_warning) = self.fresh_grant(|| self.flow.device(&self.config))?;
+        if let Some(warning) = revoke_warning {
+            warn!("login_device: {warning}");
+        }
         Ok(())
     }
 
-    /// Delete cached tokens.
+    /// Revoke the cached refresh token at Okta (RFC 7009), then delete the cache. The
+    /// cache is cleared even when revocation fails - a `logout` that leaves a token
+    /// nobody references locally would be worse than one Okta still considers live.
+    /// Error precedence: a failed clear returns `CacheWrite` (a revoked token would
+    /// still be on disk, and `is_valid()` would hand it out); otherwise a failed
+    /// revoke returns `RevokeFailed` (the server-side token may still be live).
     pub fn logout(&self) -> Result<(), OktaAuthError> {
         let dir = self.cache_dir();
+        let refresh_token = cache::load(&dir)?.and_then(|c| c.refresh_token);
+        let revoke_result = refresh_token.map(|token| self.revoke(&token));
         cache::clear(&dir)?;
-        Ok(())
+        match revoke_result {
+            Some(Err(e)) => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// The only writer of a fresh interactive grant - called by `login`, `login_device`,
+    /// and `get_token`'s interactive fallthrough. Order: guard the shared-cache
+    /// invariant -> read the previous refresh token into memory -> run `flow` -> save
+    /// the new grant -> best-effort revoke the previous token. The old token is read
+    /// once, before `flow` runs, and never re-read from disk after the save, so this
+    /// call can never revoke the grant it just wrote (e.g. a concurrent `login --force`
+    /// elsewhere). A revoke failure is never an `Err`: it comes back as `Some(text)` in
+    /// the tuple (and is `warn!`-logged) for the caller to surface to the user.
+    fn fresh_grant(
+        &self,
+        flow: impl FnOnce() -> Result<TokenCache, OktaAuthError>,
+    ) -> Result<(TokenCache, Option<String>), OktaAuthError> {
+        if self.config.cache_dir.is_none() && !self.config.scopes.iter().any(|s| s == "offline_access") {
+            return Err(OktaAuthError::SharedCacheRequiresOfflineAccess);
+        }
+        let dir = self.cache_dir();
+        let old_refresh_token = cache::load(&dir)?.and_then(|c| c.refresh_token);
+
+        let new_cache = flow()?;
+        cache::save(&dir, &new_cache)?;
+
+        let revoke_warning = match old_refresh_token {
+            Some(token) => self.revoke(&token).err().map(|e| {
+                warn!("fresh_grant: could not revoke the previous refresh token: {e}");
+                e.to_string()
+            }),
+            None => None,
+        };
+        Ok((new_cache, revoke_warning))
+    }
+
+    /// Revoke a refresh token at Okta (RFC 7009 `/v1/revoke`) as a public client: no
+    /// client secret, `client_id` in the form body. A raw form POST, the same pattern
+    /// `pkce::device` already uses against this issuer, rather than threading the
+    /// `oauth2` crate's `RevocationUrl` typestate through `BasicClient` for one call
+    /// site. Any 2xx is success; Okta returns 200 even for an already-dead token
+    /// (RFC 7009: revoking an invalid/expired/revoked token is still success).
+    fn revoke(&self, refresh_token: &str) -> Result<(), OktaAuthError> {
+        let revoke_url = format!("{}/v1/revoke", self.config.okta_issuer);
+        let http = oauth2::reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| OktaAuthError::RevokeFailed(e.to_string()))?;
+
+        let response = http
+            .post(&revoke_url)
+            .form(&[
+                ("client_id", self.config.client_id.as_str()),
+                ("token", refresh_token),
+                ("token_type_hint", "refresh_token"),
+            ])
+            .send()
+            .map_err(|e| OktaAuthError::RevokeFailed(e.to_string()))?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(OktaAuthError::RevokeFailed(format!("HTTP {}", response.status())))
+        }
     }
 
     fn refresh(&self, refresh_token: &str) -> Result<TokenCache, OktaAuthError> {
@@ -277,10 +443,25 @@ impl OktaAuth {
 
         let client = BasicClient::new(ClientId::new(self.config.client_id.to_string())).set_token_uri(token_url);
 
-        let token_response = client
+        let result = client
             .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
-            .request(&oauth2::reqwest::blocking::Client::new())
-            .map_err(|e| OktaAuthError::RefreshFailed(e.to_string()))?;
+            .request(&oauth2::reqwest::blocking::Client::new());
+
+        // Inspect the typed error BEFORE the map_err below flattens it to a string:
+        // only `invalid_grant` means the refresh token itself is dead (7 idle days,
+        // revoked, deactivated). Every other error - network, unparseable body, other
+        // ServerResponse codes such as `invalid_client` (config/app broken, not the
+        // token) - keeps the cache so a transient blip never forces a re-login. If the
+        // clear itself fails, that CacheWrite takes precedence over RefreshFailed: the
+        // filesystem is the fault, and the dead token is still on disk.
+        if let Err(RequestTokenError::ServerResponse(ref resp)) = result
+            && resp.error() == &BasicErrorResponseType::InvalidGrant
+        {
+            debug!("refresh: invalid_grant; dropping the dead refresh token from the cache");
+            cache::clear(&self.cache_dir())?;
+        }
+
+        let token_response = result.map_err(|e| OktaAuthError::RefreshFailed(e.to_string()))?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -308,23 +489,117 @@ impl OktaAuth {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
-    /// Spawn a one-shot local HTTP server (reusing the in-house `tiny_http` dep) that
-    /// answers a single request with `body` and 200/JSON, then returns the base issuer
-    /// URL pointing at it. Used to exercise the silent-refresh path without live Okta:
-    /// `refresh()` POSTs to `{issuer}/v1/token`, which this server answers.
-    fn spawn_token_server(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let port = server.server_addr().to_ip().unwrap().port();
-        let handle = std::thread::spawn(move || {
-            if let Ok(req) = server.recv() {
-                let header = "Content-Type: application/json".parse::<tiny_http::Header>().unwrap();
-                let resp = tiny_http::Response::from_string(body).with_header(header);
-                let _ = req.respond(resp);
+    /// One scripted HTTP response: status code + body.
+    type ScriptedResponse = (u16, &'static str);
+
+    /// A single request [`MockOkta`] served, recorded for tests to assert against.
+    struct RecordedRequest {
+        path: String,
+        form: HashMap<String, String>,
+        /// The cache file's `access_token` at the instant this request landed. Only
+        /// meaningful for `/v1/revoke` requests: it is what makes
+        /// `login_saves_new_grant_before_revoking_old` an assertion rather than a hope.
+        cache_access_token_at_request: Option<String>,
+    }
+
+    /// An ordered-script stand-in for Okta's token/revoke endpoints, replacing the old
+    /// one-shot server. Serves each `(status, body)` in `responses` to one incoming
+    /// request in turn, then stops; records every request's path and form body.
+    struct MockOkta {
+        base_url: String,
+        handle: std::thread::JoinHandle<Vec<RecordedRequest>>,
+    }
+
+    impl MockOkta {
+        /// Start serving `responses` in order against a fresh local port. `cache_dir`
+        /// is snapshotted (via [`cache::load`]) at the moment each `/v1/revoke` request
+        /// lands, so tests can prove save-before-revoke ordering.
+        fn start(responses: Vec<ScriptedResponse>, cache_dir: PathBuf) -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let port = server.server_addr().to_ip().unwrap().port();
+            let handle = std::thread::spawn(move || {
+                let mut recorded = Vec::new();
+                for (status, body) in responses {
+                    let Ok(mut req) = server.recv() else { break };
+                    let path = req.url().to_string();
+                    let mut raw = String::new();
+                    let _ = req.as_reader().read_to_string(&mut raw);
+                    let form: HashMap<String, String> = oauth2::url::form_urlencoded::parse(raw.as_bytes())
+                        .into_owned()
+                        .collect();
+                    let cache_access_token_at_request = if path.contains("/v1/revoke") {
+                        cache::load(&cache_dir).ok().flatten().map(|c| c.access_token)
+                    } else {
+                        None
+                    };
+                    recorded.push(RecordedRequest {
+                        path,
+                        form,
+                        cache_access_token_at_request,
+                    });
+                    let header = "Content-Type: application/json".parse::<tiny_http::Header>().unwrap();
+                    let resp = tiny_http::Response::from_string(body)
+                        .with_status_code(status)
+                        .with_header(header);
+                    let _ = req.respond(resp);
+                }
+                recorded
+            });
+            Self {
+                base_url: format!("http://127.0.0.1:{port}"),
+                handle,
             }
-        });
-        (format!("http://127.0.0.1:{port}"), handle)
+        }
+
+        /// Block until the script is exhausted (or the caller has made all its
+        /// requests) and return everything recorded, in order.
+        fn finish(self) -> Vec<RecordedRequest> {
+            self.handle.join().unwrap()
+        }
+    }
+
+    /// A [`LoginFlow`] fake that returns a canned grant and counts invocations, so
+    /// tests can assert "flow invoked / not invoked" without touching Okta.
+    struct CountingFlow {
+        interactive_calls: Arc<AtomicUsize>,
+        device_calls: Arc<AtomicUsize>,
+        result: TokenCache,
+    }
+
+    impl LoginFlow for CountingFlow {
+        fn interactive(&self, _: &OktaAuthConfig) -> Result<TokenCache, OktaAuthError> {
+            self.interactive_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.result.clone())
+        }
+
+        fn device(&self, _: &OktaAuthConfig) -> Result<TokenCache, OktaAuthError> {
+            self.device_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.result.clone())
+        }
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    /// Set `XDG_CACHE_HOME` for `body`, restoring the prior value after. Env mutation
+    /// is process-global and unsafe under Edition 2024, so every caller is
+    /// `#[serial_test::serial]` - the same lock `cache.rs`'s own env tests use, since
+    /// both mutate the same process-wide variable.
+    fn with_xdg_cache_home(dir: &std::path::Path, body: impl FnOnce()) {
+        let prior = std::env::var_os("XDG_CACHE_HOME");
+        unsafe { std::env::set_var("XDG_CACHE_HOME", dir) };
+        body();
+        match prior {
+            Some(v) => unsafe { std::env::set_var("XDG_CACHE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
+        }
     }
 
     fn test_config(tmp: &tempfile::TempDir) -> OktaAuthConfig {
@@ -467,6 +742,7 @@ mod tests {
     fn login_outcome_logged_in_message_reports_real_path() {
         let outcome = LoginOutcome::LoggedIn {
             cache_path: std::path::PathBuf::from("/home/u/.cache/okta/tokens.json"),
+            revoke_warning: None,
         };
         let msg = outcome.message();
         assert!(msg.contains("Logged in. Token cached at /home/u/.cache/okta/tokens.json."));
@@ -548,8 +824,12 @@ mod tests {
     #[test]
     fn get_token_noninteractive_refreshes_expired_token() {
         let tmp = tempfile::tempdir().unwrap();
-        let (issuer, handle) = spawn_token_server(
-            r#"{"access_token":"refreshed-access","token_type":"bearer","expires_in":3600,"refresh_token":"rotated-refresh"}"#,
+        let mock = MockOkta::start(
+            vec![(
+                200,
+                r#"{"access_token":"refreshed-access","token_type":"bearer","expires_in":3600,"refresh_token":"rotated-refresh"}"#,
+            )],
+            tmp.path().to_path_buf(),
         );
 
         // Expired access token WITH a refresh token -> silent refresh via the mock.
@@ -564,7 +844,7 @@ mod tests {
         .unwrap();
 
         let config = OktaAuthConfig {
-            okta_issuer: issuer,
+            okta_issuer: mock.base_url.clone(),
             client_id: "fake-client".to_string(),
             redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
             scopes: vec![],
@@ -581,7 +861,7 @@ mod tests {
         assert_eq!(reloaded.access_token, "refreshed-access");
         assert_eq!(reloaded.refresh_token.as_deref(), Some("rotated-refresh"));
 
-        handle.join().unwrap();
+        mock.finish();
     }
 
     #[test]
@@ -678,5 +958,850 @@ mod tests {
         // invalid redirect_uri surfaces as InvalidUrl - config error beats NonInteractive.
         let result = auth.get_token();
         assert!(matches!(result, Err(OktaAuthError::InvalidUrl(_))));
+    }
+
+    // -- logout: revoke-then-clear --
+
+    #[test]
+    fn logout_revokes_refresh_token_then_clears_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = MockOkta::start(vec![(200, "")], tmp.path().to_path_buf());
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "access".to_string(),
+                refresh_token: Some("refresh-to-revoke".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake-client".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+        auth.logout().unwrap();
+
+        assert!(!tmp.path().join("tokens.json").exists());
+        let recorded = mock.finish();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].path.contains("/v1/revoke"), "got path {}", recorded[0].path);
+        assert_eq!(
+            recorded[0].form.get("client_id").map(String::as_str),
+            Some("fake-client")
+        );
+        assert_eq!(
+            recorded[0].form.get("token").map(String::as_str),
+            Some("refresh-to-revoke")
+        );
+        assert_eq!(
+            recorded[0].form.get("token_type_hint").map(String::as_str),
+            Some("refresh_token")
+        );
+    }
+
+    #[test]
+    fn logout_clears_cache_and_returns_revoke_failed_when_endpoint_unreachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "access".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: "http://127.0.0.1:1".to_string(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+        let result = auth.logout();
+        assert!(matches!(result, Err(OktaAuthError::RevokeFailed(_))), "got {result:?}");
+        // Cleared even though the revoke failed.
+        assert!(!tmp.path().join("tokens.json").exists());
+    }
+
+    #[test]
+    fn logout_makes_no_revoke_call_without_refresh_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "access".to_string(),
+                refresh_token: None,
+                expires_at: now_secs() + 3600,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            // Unreachable: if logout attempted a revoke call, it would surface as
+            // RevokeFailed. Ok(()) is the proof that no call was made.
+            okta_issuer: "http://127.0.0.1:1".to_string(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+        auth.logout().unwrap();
+        assert!(!tmp.path().join("tokens.json").exists());
+    }
+
+    #[test]
+    fn logout_treats_200_with_error_body_as_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Okta returns 200 even for a bogus/already-revoked token (RFC 7009).
+        let mock = MockOkta::start(vec![(200, r#"{"error":"invalid_token"}"#)], tmp.path().to_path_buf());
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "access".to_string(),
+                refresh_token: Some("bogus".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+        auth.logout().unwrap();
+        mock.finish();
+    }
+
+    // -- login_or_reuse: silent refresh before prompting --
+
+    #[test]
+    fn login_or_reuse_refreshes_instead_of_prompting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = MockOkta::start(
+            vec![(
+                200,
+                r#"{"access_token":"new-access","token_type":"bearer","expires_in":3600,"refresh_token":"refresh"}"#,
+            )],
+            tmp.path().to_path_buf(),
+        );
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let interactive_calls = Arc::new(AtomicUsize::new(0));
+        let device_calls = Arc::new(AtomicUsize::new(0));
+        let flow = CountingFlow {
+            interactive_calls: Arc::clone(&interactive_calls),
+            device_calls: Arc::clone(&device_calls),
+            result: TokenCache {
+                access_token: "flow-access".to_string(),
+                refresh_token: Some("flow-refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        };
+        let auth = OktaAuth::with_flow(config, Box::new(flow));
+
+        let outcome = auth.login_or_reuse(false, true).unwrap();
+        assert!(matches!(outcome, LoginOutcome::Refreshed { .. }), "got {outcome:?}");
+        assert_eq!(interactive_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(device_calls.load(Ordering::SeqCst), 0);
+        mock.finish();
+    }
+
+    #[test]
+    fn login_or_reuse_runs_flow_when_expired_without_refresh_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: None,
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+
+        let interactive_calls = Arc::new(AtomicUsize::new(0));
+        let device_calls = Arc::new(AtomicUsize::new(0));
+        let flow = CountingFlow {
+            interactive_calls: Arc::clone(&interactive_calls),
+            device_calls: Arc::clone(&device_calls),
+            result: TokenCache {
+                access_token: "flow-access".to_string(),
+                refresh_token: Some("flow-refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        };
+        let auth = OktaAuth::with_flow(test_config(&tmp), Box::new(flow));
+
+        let outcome = auth.login_or_reuse(false, false).unwrap();
+        assert!(matches!(outcome, LoginOutcome::LoggedIn { .. }), "got {outcome:?}");
+        assert_eq!(interactive_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(device_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // -- refresh: dead-token detection and cache preservation --
+
+    #[test]
+    fn refresh_keeps_sent_refresh_token_when_response_omits_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No `refresh_token` field: exercises the fallback that keeps the sent token.
+        let mock = MockOkta::start(
+            vec![(
+                200,
+                r#"{"access_token":"new-access","token_type":"bearer","expires_in":3600}"#,
+            )],
+            tmp.path().to_path_buf(),
+        );
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: Some("sent-refresh".to_string()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+        assert_eq!(auth.get_token_noninteractive().unwrap(), "new-access");
+        let reloaded = cache::load(tmp.path()).unwrap().unwrap();
+        assert_eq!(reloaded.refresh_token.as_deref(), Some("sent-refresh"));
+        mock.finish();
+    }
+
+    #[test]
+    fn refresh_clears_cache_on_invalid_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = MockOkta::start(vec![(400, r#"{"error":"invalid_grant"}"#)], tmp.path().to_path_buf());
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: Some("dead-refresh".to_string()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+        let result = auth.get_token_noninteractive();
+        assert!(matches!(result, Err(OktaAuthError::NonInteractive)), "got {result:?}");
+        assert!(!tmp.path().join("tokens.json").exists());
+        mock.finish();
+    }
+
+    #[test]
+    fn refresh_keeps_cache_on_other_oauth_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `invalid_client` is a ServerResponse, but not InvalidGrant: config/app is
+        // broken, not the token, so the cache must survive.
+        let mock = MockOkta::start(vec![(400, r#"{"error":"invalid_client"}"#)], tmp.path().to_path_buf());
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+        let _ = auth.get_token_noninteractive();
+        let reloaded = cache::load(tmp.path()).unwrap().unwrap();
+        assert_eq!(reloaded.refresh_token.as_deref(), Some("refresh"));
+        mock.finish();
+    }
+
+    #[test]
+    fn refresh_keeps_cache_on_non_json_5xx() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = MockOkta::start(
+            vec![(503, "<html><body>Service Unavailable</body></html>")],
+            tmp.path().to_path_buf(),
+        );
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+        let _ = auth.get_token_noninteractive();
+        let reloaded = cache::load(tmp.path()).unwrap().unwrap();
+        assert_eq!(reloaded.refresh_token.as_deref(), Some("refresh"));
+        mock.finish();
+    }
+
+    #[test]
+    fn refresh_keeps_cache_on_unparseable_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = MockOkta::start(vec![(200, "not json at all")], tmp.path().to_path_buf());
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+        let _ = auth.get_token_noninteractive();
+        let reloaded = cache::load(tmp.path()).unwrap().unwrap();
+        assert_eq!(reloaded.refresh_token.as_deref(), Some("refresh"));
+        mock.finish();
+    }
+
+    #[test]
+    fn refresh_keeps_cache_on_transport_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: "http://127.0.0.1:1".to_string(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let auth = OktaAuth::new(config);
+        let _ = auth.get_token_noninteractive();
+        let reloaded = cache::load(tmp.path()).unwrap().unwrap();
+        assert_eq!(reloaded.refresh_token.as_deref(), Some("refresh"));
+    }
+
+    // -- fresh_grant: save-before-revoke ordering --
+
+    #[test]
+    fn login_saves_new_grant_before_revoking_old() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = MockOkta::start(vec![(200, "")], tmp.path().to_path_buf());
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-access".to_string(),
+                refresh_token: Some("old-refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let flow = CountingFlow {
+            interactive_calls: Arc::new(AtomicUsize::new(0)),
+            device_calls: Arc::new(AtomicUsize::new(0)),
+            result: TokenCache {
+                access_token: "new-access".to_string(),
+                refresh_token: Some("new-refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        };
+        let auth = OktaAuth::with_flow(config, Box::new(flow));
+        auth.login().unwrap();
+
+        let recorded = mock.finish();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].path.contains("/v1/revoke"));
+        // The revoked token is the OLD one...
+        assert_eq!(recorded[0].form.get("token").map(String::as_str), Some("old-refresh"));
+        // ...and by the time the revoke request lands, the cache already holds the NEW
+        // access token: save happened before revoke.
+        assert_eq!(recorded[0].cache_access_token_at_request.as_deref(), Some("new-access"));
+    }
+
+    // -- shared-cache write guard --
+
+    #[test]
+    #[serial_test::serial]
+    fn login_with_shared_cache_requires_offline_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_xdg_cache_home(tmp.path(), || {
+            let config = OktaAuthConfig {
+                // Any HTTP call here is a bug: the guard must fire before the flow runs.
+                okta_issuer: "http://127.0.0.1:1".to_string(),
+                client_id: "fake".to_string(),
+                redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+                scopes: vec!["openid".to_string()],
+                app_name: "test".to_string(),
+                cache_dir: None,
+            };
+            let interactive_calls = Arc::new(AtomicUsize::new(0));
+            let device_calls = Arc::new(AtomicUsize::new(0));
+            let flow = CountingFlow {
+                interactive_calls: Arc::clone(&interactive_calls),
+                device_calls: Arc::clone(&device_calls),
+                result: TokenCache {
+                    access_token: "x".to_string(),
+                    refresh_token: None,
+                    expires_at: 0,
+                },
+            };
+            let auth = OktaAuth::with_flow(config, Box::new(flow));
+            let result = auth.login();
+            assert!(
+                matches!(result, Err(OktaAuthError::SharedCacheRequiresOfflineAccess)),
+                "got {result:?}"
+            );
+            assert_eq!(interactive_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(device_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn login_device_with_shared_cache_requires_offline_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_xdg_cache_home(tmp.path(), || {
+            let config = OktaAuthConfig {
+                okta_issuer: "http://127.0.0.1:1".to_string(),
+                client_id: "fake".to_string(),
+                redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+                scopes: vec!["openid".to_string()],
+                app_name: "test".to_string(),
+                cache_dir: None,
+            };
+            let interactive_calls = Arc::new(AtomicUsize::new(0));
+            let device_calls = Arc::new(AtomicUsize::new(0));
+            let flow = CountingFlow {
+                interactive_calls: Arc::clone(&interactive_calls),
+                device_calls: Arc::clone(&device_calls),
+                result: TokenCache {
+                    access_token: "x".to_string(),
+                    refresh_token: None,
+                    expires_at: 0,
+                },
+            };
+            let auth = OktaAuth::with_flow(config, Box::new(flow));
+            let result = auth.login_device();
+            assert!(
+                matches!(result, Err(OktaAuthError::SharedCacheRequiresOfflineAccess)),
+                "got {result:?}"
+            );
+            assert_eq!(interactive_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(device_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn get_token_fallthrough_with_shared_cache_requires_offline_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_xdg_cache_home(tmp.path(), || {
+            let dir = cache::default_cache_dir();
+            cache::save(
+                &dir,
+                &TokenCache {
+                    access_token: "old-expired".to_string(),
+                    refresh_token: None,
+                    expires_at: 0,
+                },
+            )
+            .unwrap();
+
+            let config = OktaAuthConfig {
+                okta_issuer: "http://127.0.0.1:1".to_string(),
+                client_id: "fake".to_string(),
+                redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+                scopes: vec!["openid".to_string()],
+                app_name: "test".to_string(),
+                cache_dir: None,
+            };
+            let interactive_calls = Arc::new(AtomicUsize::new(0));
+            let device_calls = Arc::new(AtomicUsize::new(0));
+            let flow = CountingFlow {
+                interactive_calls: Arc::clone(&interactive_calls),
+                device_calls: Arc::clone(&device_calls),
+                result: TokenCache {
+                    access_token: "x".to_string(),
+                    refresh_token: None,
+                    expires_at: 0,
+                },
+            };
+            let auth = OktaAuth::with_flow(config, Box::new(flow));
+            let result = auth.get_token();
+            assert!(
+                matches!(result, Err(OktaAuthError::SharedCacheRequiresOfflineAccess)),
+                "got {result:?}"
+            );
+            assert_eq!(interactive_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(device_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn login_with_explicit_cache_dir_allows_any_scopes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = OktaAuthConfig {
+            okta_issuer: "https://test.okta.com/oauth2/default".to_string(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            // No `offline_access`, but `cache_dir` is explicit: the guard does not apply.
+            scopes: vec!["openid".to_string()],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let interactive_calls = Arc::new(AtomicUsize::new(0));
+        let device_calls = Arc::new(AtomicUsize::new(0));
+        let flow = CountingFlow {
+            interactive_calls: Arc::clone(&interactive_calls),
+            device_calls,
+            result: TokenCache {
+                access_token: "flow-access".to_string(),
+                refresh_token: None,
+                expires_at: now_secs() + 3600,
+            },
+        };
+        let auth = OktaAuth::with_flow(config, Box::new(flow));
+        auth.login().unwrap();
+        assert_eq!(interactive_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn get_token_read_path_is_not_guarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_xdg_cache_home(tmp.path(), || {
+            let dir = cache::default_cache_dir();
+            cache::save(
+                &dir,
+                &TokenCache {
+                    access_token: "valid-shared".to_string(),
+                    refresh_token: None,
+                    expires_at: now_secs() + 3600,
+                },
+            )
+            .unwrap();
+
+            let config = OktaAuthConfig {
+                okta_issuer: "http://127.0.0.1:1".to_string(),
+                client_id: "fake".to_string(),
+                redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+                // No `offline_access`: the read path is not guarded, only fresh_grant is.
+                scopes: vec!["openid".to_string()],
+                app_name: "test".to_string(),
+                cache_dir: None,
+            };
+            let auth = OktaAuth::new(config);
+            assert_eq!(auth.get_token().unwrap(), "valid-shared");
+        });
+    }
+
+    // -- fresh_grant: revoke_warning surfacing --
+
+    #[test]
+    fn login_or_reuse_reports_revoke_failure_in_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-access".to_string(),
+                refresh_token: Some("old-refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: "http://127.0.0.1:1".to_string(), // unreachable -> revoke fails
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let flow = CountingFlow {
+            interactive_calls: Arc::new(AtomicUsize::new(0)),
+            device_calls: Arc::new(AtomicUsize::new(0)),
+            result: TokenCache {
+                access_token: "new-access".to_string(),
+                refresh_token: Some("new-refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        };
+        let auth = OktaAuth::with_flow(config, Box::new(flow));
+
+        let outcome = auth.login_or_reuse(true, false).unwrap();
+        match &outcome {
+            LoginOutcome::LoggedIn { revoke_warning, .. } => {
+                assert!(revoke_warning.is_some(), "expected a revoke warning, got None")
+            }
+            other => panic!("expected LoggedIn, got {other:?}"),
+        }
+        assert!(
+            outcome.message().contains("could not be revoked"),
+            "got: {}",
+            outcome.message()
+        );
+    }
+
+    #[test]
+    fn login_or_reuse_happy_path_has_no_revoke_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = MockOkta::start(vec![(200, "")], tmp.path().to_path_buf());
+        cache::save(
+            tmp.path(),
+            &TokenCache {
+                access_token: "old-access".to_string(),
+                refresh_token: Some("old-refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        )
+        .unwrap();
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(tmp.path().to_path_buf()),
+        };
+        let flow = CountingFlow {
+            interactive_calls: Arc::new(AtomicUsize::new(0)),
+            device_calls: Arc::new(AtomicUsize::new(0)),
+            result: TokenCache {
+                access_token: "new-access".to_string(),
+                refresh_token: Some("new-refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        };
+        let auth = OktaAuth::with_flow(config, Box::new(flow));
+
+        let outcome = auth.login_or_reuse(true, false).unwrap();
+        match &outcome {
+            LoginOutcome::LoggedIn { revoke_warning, .. } => {
+                assert!(revoke_warning.is_none(), "got {revoke_warning:?}")
+            }
+            other => panic!("expected LoggedIn, got {other:?}"),
+        }
+        assert!(
+            !outcome.message().contains("could not be revoked"),
+            "got: {}",
+            outcome.message()
+        );
+        mock.finish();
+    }
+
+    // -- CacheWrite precedence when clear/save fails on a read-only cache dir --
+
+    #[cfg(unix)]
+    #[test]
+    fn logout_returns_cache_write_when_clear_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ro-cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        cache::save(
+            &dir,
+            &TokenCache {
+                access_token: "access".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: now_secs() + 3600,
+            },
+        )
+        .unwrap();
+        let mock = MockOkta::start(vec![(200, "")], dir.clone());
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(dir.clone()),
+        };
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let auth = OktaAuth::new(config);
+        let result = auth.logout();
+
+        // Restore write permission so the tempdir can clean itself up.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(result, Err(OktaAuthError::CacheWrite(_))), "got {result:?}");
+        mock.finish();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_invalid_grant_with_failed_clear_returns_cache_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ro-cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        cache::save(
+            &dir,
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: Some("dead-refresh".to_string()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+        let mock = MockOkta::start(vec![(400, r#"{"error":"invalid_grant"}"#)], dir.clone());
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(dir.clone()),
+        };
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let auth = OktaAuth::new(config);
+        let result = auth.get_token_noninteractive();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(result, Err(OktaAuthError::CacheWrite(_))), "got {result:?}");
+        mock.finish();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_token_propagates_cache_write_instead_of_opening_browser() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ro-cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        cache::save(
+            &dir,
+            &TokenCache {
+                access_token: "old-expired".to_string(),
+                refresh_token: Some("dead-refresh".to_string()),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+        let mock = MockOkta::start(vec![(400, r#"{"error":"invalid_grant"}"#)], dir.clone());
+
+        let config = OktaAuthConfig {
+            okta_issuer: mock.base_url.clone(),
+            client_id: "fake".to_string(),
+            redirect_uri: "http://127.0.0.1:19999/callback".to_string(),
+            scopes: vec![],
+            app_name: "test".to_string(),
+            cache_dir: Some(dir.clone()),
+        };
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let interactive_calls = Arc::new(AtomicUsize::new(0));
+        let device_calls = Arc::new(AtomicUsize::new(0));
+        let flow = CountingFlow {
+            interactive_calls: Arc::clone(&interactive_calls),
+            device_calls,
+            result: TokenCache {
+                access_token: "browser-access".to_string(),
+                refresh_token: None,
+                expires_at: now_secs() + 3600,
+            },
+        };
+        let auth = OktaAuth::with_flow(config, Box::new(flow));
+        let result = auth.get_token();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(result, Err(OktaAuthError::CacheWrite(_))), "got {result:?}");
+        assert_eq!(interactive_calls.load(Ordering::SeqCst), 0);
+        mock.finish();
     }
 }

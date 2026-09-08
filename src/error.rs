@@ -50,6 +50,16 @@ pub enum OktaAuthError {
     #[error("Refresh token exchange failed: {0}")]
     RefreshFailed(String),
 
+    #[error("Refresh token revocation failed: {0}")]
+    RevokeFailed(String),
+
+    #[error(
+        "scopes omit `offline_access` but the token cache is the shared default \
+         (~/.cache/okta): a login here would strip the refresh token every sibling CLI \
+         relies on. Add `offline_access` to `scopes`, or set an explicit `cache_dir`."
+    )]
+    SharedCacheRequiresOfflineAccess,
+
     #[error("Failed to read token cache: {0}")]
     CacheRead(String),
 
@@ -99,6 +109,16 @@ mod tests {
             (
                 OktaAuthError::RefreshFailed("expired".to_string()),
                 "Refresh token exchange failed: expired",
+            ),
+            (
+                OktaAuthError::RevokeFailed("HTTP 500".to_string()),
+                "Refresh token revocation failed: HTTP 500",
+            ),
+            (
+                OktaAuthError::SharedCacheRequiresOfflineAccess,
+                "scopes omit `offline_access` but the token cache is the shared default \
+                 (~/.cache/okta): a login here would strip the refresh token every sibling CLI \
+                 relies on. Add `offline_access` to `scopes`, or set an explicit `cache_dir`.",
             ),
             (
                 OktaAuthError::CacheRead("permission denied".to_string()),
