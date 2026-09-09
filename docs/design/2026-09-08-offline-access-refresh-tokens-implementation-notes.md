@@ -679,3 +679,89 @@ A cargo hazard in the same class as the shared-`target/` staleness seen in okta-
 ```
 
 Cargo then replays that cached failure on every later run in that repo, sandbox or not, so the repo looks permanently broken while its neighbours build fine. It hit sdv and persona-cli here. The tell is a 221-byte `.rustc_info.json` against ~1.3k in a healthy repo. Deleting the file fixes it; no code change is warranted.
+
+## Phase 4 and closeout: every open item resolved
+
+Phase 4 ran 2026-09-08 against the installed binaries after all six releases shipped.
+This section closes the record: every item this plan left open is listed with how it
+was settled and the evidence that settled it. Nothing below is carried forward.
+
+### Phase 4: live verification, all five checks passed
+
+Run against `slack v0.11.0`, `persona v1.8.4`, `marquee v1.17.6`, `sdv v0.5.3`, all
+built against `okta-auth v0.7.0 (?tag=v0.7.0#d830c400)`.
+
+| check | result |
+|---|---|
+| `slack login --force` mints a refresh token | `refresh_token` non-null, 43 chars; access token `scp` = `[offline_access, email, openid, profile]`; 12h lifetime |
+| unattended refresh, no controlling terminal | `XDG_CACHE_HOME=<copy> setsid -w slack whoami </dev/null` on `expires_at = 0` -> exit 0, printed the email, rewrote `expires_at` to now + 12h |
+| `login` (no `--force`) on an expired cache | printed `Refreshed Okta token (cached at ...)`, exit 0, no browser |
+| fleet on the shared cache | `persona` / `marquee` / `sdv` / `slack` `whoami` each exit 0, no prompt, under `setsid` with no tty |
+| `logout` revokes at Okta | `Logged out. Okta and Slack token caches cleared.` exit 0; both cache files gone; introspect of the saved token -> `active: false`; a refresh with it -> HTTP 400 `invalid_grant` |
+
+The second row is the one that matters: on `main` that exact probe exited 1 with
+"Okta token is missing or expired and no controlling terminal is available". It is the
+`slack scheduled deliver` systemd-timer case the whole plan was written for.
+
+### Open questions from earlier phases, now closed
+
+- **`doc:554`, "each login mints its own refresh token" - CLOSED, doc was right.**
+  Carried as unproven since Phase 0, because Phase 0 measured only the refresh path.
+  Settled on real hardware: a device grant authorized from `ltl-7007.lan` against the
+  same user and client as the live `desk.lan` grant produced a DISTINCT refresh token
+  (sha256 `3e14edf4...` vs `8447231c...`). Revoking the laptop's token returned 200 and
+  flipped it to `active: false`; the desktop's stayed `active: true` and still completed
+  an unattended refresh. The persistent-token echo is confined to the REFRESH path and
+  does not extend to re-authorization. The doc sentence is now backed by measurement
+  rather than assumption.
+
+- **The "response omits `refresh_token`" clause - CLOSED, doc was wrong, now corrected.**
+  Phase 0 measured the opposite: the tenant echoes the same token back, byte-identical.
+  Both occurrences in the design doc are corrected, and the claim that the
+  `src/lib.rs:295-298` fallback is "load-bearing" is walked back to what it is: defence
+  against a tenant or mock that omits the field, covered by
+  `refresh_keeps_sent_refresh_token_when_response_omits_it`, not exercised by this
+  tenant's happy path.
+
+- **`e2592e3` merged without human review - CLOSED, audited, no defect.**
+  The SRE approval on #19 landed at 18:27:38Z and `e2592e3` was pushed at 18:29:19Z, so
+  the approval predated the commit; `require_last_push_approval: false` let it merge.
+  The commit was audited line by line afterwards: one file, two hunks changing
+  `cache::load(&dir)?` to a `match` that warns and yields `None`, plus two tests.
+  Save-before-revoke ordering, the shared-cache guard and `CacheWrite` precedence are
+  all untouched, and happy-path semantics are identical. Procedural gap, not a defect.
+
+- **Rust caught all error variants where Python caught two - CLOSED, fixed in `#21`.**
+  `v0.7.0` shipped the catch-all `Err(e)` at both recovery sites. It was never a defect
+  (`cache::load` can only produce `CacheRead` (`src/cache.rs:80`) or `CacheParse`
+  (`:81`)), but it was the weaker shape on the credential path and it diverged from the
+  narrow Python catch. Narrowed to
+  `Err(e @ (OktaAuthError::CacheRead(_) | OktaAuthError::CacheParse(_)))` with an
+  explicit `Err(e) => return Err(e)` beneath, and both warnings now log the cache path
+  to match Python. Merged as `cb5dbd2` (#21). The ports are aligned; the deferral
+  recorded in the previous section is superseded.
+
+- **`get_token` / `get_token_noninteractive` corrupt-cache self-heal - CLOSED as
+  deliberate, no change.** CodeRabbit asked for it on `okta-auth-py#7`. Declined in two
+  parts. The `_try_silent_refresh` half is unobservable: `login_or_reuse:162` calls
+  `cached_valid_token()` before `:168`, so a corrupt cache raises at 162 and 168 is
+  unreachable. The `get_token` half is pre-existing on `origin/main` (`auth.py:148`,
+  `:185`) and `cached_valid_token`'s docstring documents the propagation as intentional.
+  Both ports behave identically here, so no drift. A corrupt cache produces a loud error
+  on a read path and is repaired by `logout` or `login --force`, both of which now
+  self-heal. Reasoning posted on the PR thread.
+
+### Deviation on the record
+
+All five PRs (#46 slack-cli, #87 marquee, #14 sdv, #7 okta-auth-py, #20 okta-auth-rs)
+merged with ZERO approving reviews, three of them past a live `REVIEW_REQUIRED` gate.
+That was the repository owner's own decision, made knowingly, not a gate any agent or
+reviewer satisfied. Recorded here because the release notes should not read as
+"approved and merged" when no approval exists. Separately, every commit, merge and tag
+in this work is attributable to the same GitHub identity, so the audit trail cannot
+distinguish a human action from an automated one.
+
+### Status
+
+All five acceptance criteria are checked off in the design doc with post-ship measured
+values beside them. No open questions remain in any phase of this plan.

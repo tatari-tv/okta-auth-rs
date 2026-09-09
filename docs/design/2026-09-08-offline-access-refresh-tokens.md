@@ -212,7 +212,7 @@ in the Review Log; Open Questions is empty; every acceptance criterion carries a
   re-login replaces the cache without revoking the previous refresh token, leaving a
   live orphan for up to 7 idle days: `login()`/`login_device()` now revoke the cached
   refresh token best-effort before caching the new grant. Also recorded Okta's
-  persistent-token refresh semantics (response omits `refresh_token`; the crate's
+  persistent-token refresh semantics (response echoes the SAME `refresh_token`; the crate's
   keep-the-old-token fallback is load-bearing), fixed Phase 0 to poll until approved,
   and pinned the AC6 observation to the installed `slack v0.8.0`.
 
@@ -390,8 +390,15 @@ a transport error maps to `RevokeFailed(<reqwest error>)`.
   `client_id` in the body, no secret. Unchanged. Okta's persistent-token behavior
   (refresh-tokens guide: "If the lifetime setting hasn't expired, when a client makes
   a request for a new access token, Okta only returns the new access token") means
-  the response omits `refresh_token`; `refresh()` already falls back to the token it
-  sent (`src/lib.rs:295-298`). That fallback is load-bearing and gets a test.
+  the response echoes the SAME `refresh_token` back rather than omitting it.
+  **Corrected 2026-09-08 by Phase 0 against the live tenant: the returned token is
+  byte-identical to the one sent (`same_refresh_token: True`).** Persistence is
+  confirmed - the tenant does not rotate - but by echo, not by omission. `refresh()`
+  already falls back to the token it sent (`src/lib.rs:295-298`); that fallback stays as
+  defence against a tenant or mock that omits the field and is covered by
+  `refresh_keeps_sent_refresh_token_when_response_omits_it`, but it is NOT exercised by
+  this tenant's happy path. The original wording ("omits", "load-bearing") overstated
+  it and is corrected here.
 - Dead-token detection uses the typed error the `oauth2` crate already returns, and
   must inspect it BEFORE the existing `.map_err(|e| RefreshFailed(e.to_string()))` at
   `src/lib.rs:283` flattens it to a string: `RequestTokenError::ServerResponse(r)` with
@@ -552,7 +559,13 @@ Consumer-facing behavior:
   flow once; no-tty processes fail fast with the existing `NonInteractive` hint, and
   the dead token is gone from disk so the next `login` goes straight to the flow.
 - Two machines: each login mints its own refresh token; `logout` on one leaves the
-  other logged in.
+  other logged in. **Verified 2026-09-08 on real hardware rather than assumed.** A device
+  grant authorized from `ltl-7007.lan` and the live grant on `desk.lan` - same user, same
+  client - produced DISTINCT refresh tokens (sha256 `3e14edf4...` vs `8447231c...`, both
+  43 chars). Revoking the laptop's token returned HTTP 200 and flipped it to
+  `active: false`, while the desktop's token stayed `active: true` and still completed an
+  unattended `setsid slack whoami` refresh (exit 0). So the persistent-token echo proven
+  in Phase 0 is confined to the REFRESH path and does not extend to re-authorization.
 - `<tool> logout`: one extra HTTP call. On failure prints
   `logout failed: Refresh token revocation failed: ...`; the local cache is gone
   regardless.
@@ -757,13 +770,14 @@ cache to `refresh_token: null` on its next login.
 
 ## Acceptance Criteria
 
-- [ ] Both ports request the scope: `rg -c 'offline_access' src/tatari.rs || echo 0`
+- [x] Both ports request the scope: `rg -c 'offline_access' src/tatari.rs || echo 0`
   in okta-auth-rs and `rg -c 'offline_access' src/okta_auth/tatari.py || echo 0` in
   okta-auth-py each print >= 1. Observed on main: `0` and `0` (bare `rg -c` prints
   nothing and exits 1 on zero matches; the `|| echo 0` makes the baseline literal).
-- [ ] `rg -c 'v1/revoke' src/lib.rs || echo 0` in okta-auth-rs prints >= 1.
-  Observed on main: `0`.
-- [ ] All four consumers pin the Phase 1 tag. Distinct `okta-auth` tags across
+  **VERIFIED post-ship 2026-09-08: `3` and `2`. PASS.**
+- [x] `rg -c 'v1/revoke' src/lib.rs || echo 0` in okta-auth-rs prints >= 1.
+  Observed on main: `0`. **VERIFIED post-ship 2026-09-08: `8`. PASS.**
+- [x] All four consumers pin the Phase 1 tag. Distinct `okta-auth` tags across
   slack-cli, marquee/cli, persona-cli, sdv `Cargo.toml`:
   ```
   rg --no-filename -o 'okta-auth.*tag = "v[0-9.]+"' <the four Cargo.toml> | rg -o 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -u
@@ -774,12 +788,15 @@ cache to `refresh_token: null` on its next login.
   `version` field beside the tag breaks resolution while passing the tag grep).
   Observed on main: two lines, `v0.5.0` and `v0.6.0`; no `OKTA_AUTH_TAG` exists yet;
   the `version =` grep prints `1` (slack-cli `Cargo.toml:30`).
-- [ ] Stale claims gone. Over slack-cli `README.md`, sdv `sdv.yml`, sdv `CLAUDE.md`:
+  **VERIFIED post-ship 2026-09-08: the distinct-tag command prints exactly one line,
+  `v0.7.0`, which equals `OKTA_AUTH_TAG`; the `version =` grep prints `0`. PASS.**
+- [x] Stale claims gone. Over slack-cli `README.md`, sdv `sdv.yml`, sdv `CLAUDE.md`:
   ```
   rg -c 'no `offline_access`|silent-refresh Okta path' <the three files>
   ```
   returns 0 lines. Observed on main: 1 line in each of the three files.
-- [ ] Unattended refresh works: after one post-ship `login`,
+  **VERIFIED post-ship 2026-09-08: 0 lines. PASS.**
+- [x] Unattended refresh works: after one post-ship `login`,
   `jq -r .refresh_token ~/.cache/okta/tokens.json` is a non-null string, and with a
   cache copy whose `expires_at` is 0:
   ```
@@ -792,6 +809,13 @@ cache to `refresh_token: null` on its next login.
   terminal is available (non-interactive session)`. An earlier run against the
   installed `slack v0.8.0` gave the same result and was replaced because a baseline
   belongs to the tree, not to whatever is on `$PATH` (Architect, r1).
+  **VERIFIED post-ship 2026-09-08 against the installed `slack v0.11.0`:
+  `jq -r .refresh_token ~/.cache/okta/tokens.json` returns a non-null 43-char string;
+  the access token's `scp` is `[offline_access, email, openid, profile]`; and
+  `XDG_CACHE_HOME=<copy> setsid -w slack whoami </dev/null` on a cache with
+  `expires_at = 0` exits 0, prints `scott.idler@tatari.tv`, and rewrites `expires_at`
+  to now + 12h. This is the criterion that exited 1 on main with "no controlling
+  terminal"; it is the headline fix and it now passes. PASS.**
 
 ## Resolved Decisions
 
