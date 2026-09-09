@@ -717,8 +717,12 @@ The second row is the one that matters: on `main` that exact probe exited 1 with
 
 - **The "response omits `refresh_token`" clause - CLOSED, doc was wrong, now corrected.**
   Phase 0 measured the opposite: the tenant echoes the same token back, byte-identical.
-  Both occurrences in the design doc are corrected, and the claim that the
-  `src/lib.rs:295-298` fallback is "load-bearing" is walked back to what it is: defence
+  All THREE occurrences in the design doc are corrected (the two Architecture clauses
+  and the Phase 0 expectation bullet, which still read "expected: absent, persistent
+  token" and is now labelled as the pre-verification hypothesis the run disproved). An
+  earlier draft of this section said "both occurrences", missing the Phase 0 bullet;
+  CodeRabbit caught the inconsistency on #22 and it is corrected here. The claim that
+  the `src/lib.rs:295-298` fallback is "load-bearing" is walked back to what it is: defence
   against a tenant or mock that omits the field, covered by
   `refresh_keeps_sent_refresh_token_when_response_omits_it`, not exercised by this
   tenant's happy path.

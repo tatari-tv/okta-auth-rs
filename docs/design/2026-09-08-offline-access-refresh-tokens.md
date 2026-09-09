@@ -348,7 +348,7 @@ rotated-refresh persistence (test at `src/lib.rs:550`, assertions at `:579-582`)
 
 ### Architecture
 
-```
+```text
 login (browser | device)  ->  Okta /v1/token  ->  { access, refresh, expires_in }
                                                    -> ~/.cache/okta/tokens.json (0600)
 
@@ -585,8 +585,9 @@ cache to `refresh_token: null` on its next login.
 - Poll `/v1/token` at the returned `interval` until approved; record `scp`, presence
   of `refresh_token`, `expires_in`. Note whether a consent screen appeared.
 - Exercise a refresh with that token: POST `/v1/token grant_type=refresh_token`;
-  record whether the response carries `refresh_token` (expected: absent, persistent
-  token) and that the new access token's `scp` matches.
+  record whether the response carries `refresh_token` (pre-verification hypothesis was
+  "absent, persistent token"; **the run disproved it - the response carries the SAME
+  token back, byte-identical**) and that the new access token's `scp` matches.
 - `/v1/introspect` the refresh token with `client_id` only: expect `active: true`.
 - `/v1/revoke` it with `client_id` + `token_type_hint=refresh_token`: expect 200.
 - `/v1/introspect` again: expect `active: false`.
@@ -779,7 +780,7 @@ cache to `refresh_token: null` on its next login.
   Observed on main: `0`. **VERIFIED post-ship 2026-09-08: `8`. PASS.**
 - [x] All four consumers pin the Phase 1 tag. Distinct `okta-auth` tags across
   slack-cli, marquee/cli, persona-cli, sdv `Cargo.toml`:
-  ```
+  ```text
   rg --no-filename -o 'okta-auth.*tag = "v[0-9.]+"' <the four Cargo.toml> | rg -o 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -u
   ```
   prints exactly one line, and that line equals `OKTA_AUTH_TAG` (the tag Phase 1
@@ -791,7 +792,7 @@ cache to `refresh_token: null` on its next login.
   **VERIFIED post-ship 2026-09-08: the distinct-tag command prints exactly one line,
   `v0.7.0`, which equals `OKTA_AUTH_TAG`; the `version =` grep prints `0`. PASS.**
 - [x] Stale claims gone. Over slack-cli `README.md`, sdv `sdv.yml`, sdv `CLAUDE.md`:
-  ```
+  ```text
   rg -c 'no `offline_access`|silent-refresh Okta path' <the three files>
   ```
   returns 0 lines. Observed on main: 1 line in each of the three files.
@@ -799,7 +800,7 @@ cache to `refresh_token: null` on its next login.
 - [x] Unattended refresh works: after one post-ship `login`,
   `jq -r .refresh_token ~/.cache/okta/tokens.json` is a non-null string, and with a
   cache copy whose `expires_at` is 0:
-  ```
+  ```text
   XDG_CACHE_HOME=<copy> setsid -w slack whoami </dev/null
   ```
   exits 0 and prints the email. Observed on main: `refresh_token` is `null`; the probe
