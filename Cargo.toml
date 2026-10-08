@@ -1,6 +1,6 @@
 [package]
 name = "okta-auth"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 authors = ["Scott Idler <scott.idler@tatari.tv>"]
 description = "Rust library for Okta OAuth2 PKCE authentication in CLI tools - browser login, token caching, and transparent refresh"
