@@ -18,3 +18,5 @@ permissions:
 jobs:
   ci:
     uses: tatari-tv/github-actions-public/.github/workflows/rust-ci.yml@v1
+    with:
+      rust-version: "1.99.1"
