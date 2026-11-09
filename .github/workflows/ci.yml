@@ -3,7 +3,7 @@ name: ci
 # Public repo: calls the PUBLIC reusable. Previously this called the INTERNAL
 # tatari-tv/github-actions platform-standard-ci.yml@v5, which a public repo cannot
 # resolve (GitHub blocks public -> internal), producing a 0-job startup failure.
-# Swapped to the public twin tatari-tv/github-actions-public/rust-ci.yml@v1. CI =
+# Swapped to the public twin tatari-tv/github-actions-public/rust-ci.yml. CI =
 # `otto ci`; the caller owns the trigger. Toolchain (1.96.0) and whitespace (v0.1.6)
 # use the reusable's defaults. No id-token/statuses/secrets needed: the public
 # reusable runs on a bare runner (no ECR), only contents: read. Library -> CI only.
@@ -17,6 +17,6 @@ permissions:
 
 jobs:
   ci:
-    uses: tatari-tv/github-actions-public/.github/workflows/rust-ci.yml@v1
+    uses: tatari-tv/github-actions-public/.github/workflows/rust-ci.yml@v2.4.2
     with:
       rust-version: "1.99.1"
